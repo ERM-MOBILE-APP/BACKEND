@@ -7,12 +7,22 @@ const {
   getMyLeaves,
   getAllLeaves,
   updateLeaveStatus,
+  cancelLeave,
+  getLeaveTypes,
+  getPermissionTypes,
+  getLeaveBalance,
 } = require('../controllers/leaveController');
+
+// Static helper routes (no auth needed for dropdown lists)
+router.get('/types', getLeaveTypes);
+router.get('/permission-types', getPermissionTypes);
 
 // Employee
 router.post('/apply', auth, applyLeave);
 router.post('/permission', auth, applyPermission);
 router.get('/me', auth, getMyLeaves);
+router.get('/balance', auth, getLeaveBalance);
+router.delete('/:id', auth, cancelLeave);
 
 // Admin / manager
 router.get('/', auth, getAllLeaves);

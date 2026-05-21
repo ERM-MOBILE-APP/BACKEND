@@ -11,15 +11,18 @@ mongoose.connect(process.env.MONGO_URI).then(async () => {
   const hashedPassword = await bcrypt.hash('password123', 10);
 
   await db.collection('users').insertOne({
-    userId: 'EMP001',
-    name: 'Hari Krishna',
+    userId: 'TES005',
+    name: 'Vijay',
     password: hashedPassword,
     role: 'employee',
-    designation: 'Software Engineer',
-    email: 'hari@tescodigitals.com',
-    phone: '+91 98765 43210',
-    dob: '15 Jan 1998',
+    designation: 'UI UX Designer',
+    email: 'Bhvhjh@Gmail.Com',
+    phone: '+91 9988776655',
+    dob: '20-09-2005',
     gender: 'Male',
+    bloodGroup: 'A+',
+    photoUrl: '',
+    address: '',
     status: 'Active',
     workType: 'Remote',
     leaveBalance: 12,
@@ -30,7 +33,7 @@ mongoose.connect(process.env.MONGO_URI).then(async () => {
 
   console.log('User created with full profile data');
 
-  const user = await db.collection('users').findOne({ userId: 'EMP001' });
+  const user = await db.collection('users').findOne({ userId: 'TES005' });
   console.log('Saved user:', user);
 
   mongoose.disconnect();
