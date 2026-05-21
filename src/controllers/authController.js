@@ -1,17 +1,20 @@
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { sendOtpEmail, getStatus } = require('../services/emailService');
 
-// In-memory OTP store: { email: { otp, expiresAt } }
+// In-memory OTP store: { email: { otp, expiresAt, attempts } }
 // Replace with Redis or DB in production.
 const otpStore = new Map();
+const MAX_ATTEMPTS = 5;
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 min
 
 exports.login = async (req, res) => {
   const { userId, password } = req.body;
   try {
     // userId field may contain either userId or email
     const user = await User.findOne({
-      $or: [{ userId }, { email: userId }],
+      $or: [{ userId }, { email: (userId || '').toLowerCase().trim() }],
     });
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(401).json({ message: 'Invalid credentials' });
@@ -19,34 +22,54 @@ exports.login = async (req, res) => {
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { name: user.name, userId: user.userId, role: user.role } });
   } catch (err) {
+    console.error('[login]', err);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
 /**
  * Send OTP to user's registered email.
- * Mock implementation — generates a 6-digit OTP and stores it in memory.
- * In production: send via email service (SendGrid, SES, etc.).
+ * Sends to ANY email address (we do not 404 here) so forgot-password works
+ * for users whose User record has no email column populated yet.
  */
 exports.sendOtp = async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: 'Email is required' });
 
   try {
-    // Optionally check user exists. Comment out to allow OTP for any email.
-    // const user = await User.findOne({ email });
-    // if (!user) return res.status(404).json({ message: 'No account found for this email' });
+    const normalized = email.toLowerCase().trim();
+
+    // Soft check — log if no user, but still send OTP (you might want to
+    // tighten this later). Useful when User records lack email field.
+    const user = await User.findOne({ email: normalized });
+    if (!user) {
+      console.warn(`[sendOtp] no User record for ${normalized} — sending OTP anyway`);
+    }
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 min
-    otpStore.set(email.toLowerCase(), { otp, expiresAt });
+    const expiresAt = Date.now() + OTP_TTL_MS;
+    otpStore.set(normalized, { otp, expiresAt, attempts: 0 });
 
-    console.log(`[OTP] ${email} -> ${otp} (mock — log only, no email sent)`);
+    console.log(`[sendOtp] generated OTP for ${normalized}: ${otp}`);
 
-    return res.json({
+    const result = await sendOtpEmail(normalized, otp);
+
+    if (result.sent) {
+      return res.json({
+        success: true,
+        message: `OTP sent to ${email}. Please check your inbox (and spam folder).`,
+      });
+    }
+
+    // email failed — surface devOtp in non-prod so user can still test
+    console.error('[sendOtp] email send failed:', result.error);
+    return res.status(200).json({
       success: true,
-      message: `OTP sent to ${email}. Please check your inbox.`,
-      // never expose otp in real APIs — kept here only for dev testing:
+      emailSent: false,
+      message:
+        process.env.NODE_ENV === 'production'
+          ? 'OTP generated but email delivery failed. Please contact admin.'
+          : `Email failed: ${result.error}. Dev OTP returned in devOtp field.`,
       ...(process.env.NODE_ENV !== 'production' && { devOtp: otp }),
     });
   } catch (err) {
@@ -56,27 +79,100 @@ exports.sendOtp = async (req, res) => {
 };
 
 /**
- * Verify OTP entered by user.
+ * Verify OTP entered by user. Returns short-lived reset token on success.
  */
 exports.verifyOtp = async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp)
     return res.status(400).json({ message: 'Email and OTP are required' });
 
-  const record = otpStore.get(email.toLowerCase());
-  if (!record) return res.status(400).json({ message: 'No OTP requested for this email' });
-  if (Date.now() > record.expiresAt) {
-    otpStore.delete(email.toLowerCase());
-    return res.status(400).json({ message: 'OTP expired. Please request a new one.' });
-  }
-  if (record.otp !== otp) return res.status(400).json({ message: 'Invalid OTP' });
+  const normalized = email.toLowerCase().trim();
+  const record = otpStore.get(normalized);
 
-  otpStore.delete(email.toLowerCase());
+  if (!record)
+    return res.status(400).json({ message: 'No OTP requested for this email' });
+
+  if (Date.now() > record.expiresAt) {
+    otpStore.delete(normalized);
+    return res
+      .status(400)
+      .json({ message: 'OTP expired. Please request a new one.' });
+  }
+
+  if (record.attempts >= MAX_ATTEMPTS) {
+    otpStore.delete(normalized);
+    return res
+      .status(429)
+      .json({ message: 'Too many failed attempts. Request a new OTP.' });
+  }
+
+  if (record.otp !== String(otp).trim()) {
+    record.attempts += 1;
+    return res.status(400).json({
+      message: `Invalid OTP. ${MAX_ATTEMPTS - record.attempts} attempt(s) left.`,
+    });
+  }
+
+  // success — delete OTP and return reset token
+  otpStore.delete(normalized);
   const resetToken = jwt.sign(
-    { email, type: 'reset' },
+    { email: normalized, type: 'reset' },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
 
-  return res.json({ success: true, message: 'OTP verified', resetToken });
+  return res.json({
+    success: true,
+    message: 'OTP verified successfully',
+    resetToken,
+  });
+};
+
+/**
+ * Reset password using a valid reset token from verifyOtp.
+ */
+exports.resetPassword = async (req, res) => {
+  const { resetToken, newPassword } = req.body;
+  if (!resetToken || !newPassword)
+    return res
+      .status(400)
+      .json({ message: 'resetToken and newPassword are required' });
+
+  if (newPassword.length < 6)
+    return res
+      .status(400)
+      .json({ message: 'Password must be at least 6 characters' });
+
+  try {
+    const decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+    if (decoded.type !== 'reset')
+      return res.status(400).json({ message: 'Invalid reset token' });
+
+    const user = await User.findOne({ email: decoded.email });
+    if (!user)
+      return res.status(404).json({
+        message: 'No account found for this email. Cannot reset password.',
+      });
+
+    user.password = newPassword; // pre-save hook will hash
+    await user.save();
+
+    console.log(`[resetPassword] ✓ password updated for ${decoded.email}`);
+    return res.json({ success: true, message: 'Password reset successful' });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError')
+      return res
+        .status(400)
+        .json({ message: 'Reset session expired. Please start over.' });
+    console.error('[resetPassword]', err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+};
+
+/**
+ * Diagnostic endpoint — returns SMTP config state without exposing the password.
+ * Visit /api/auth/email-status to debug email delivery.
+ */
+exports.emailStatus = (req, res) => {
+  res.json({ smtp: getStatus() });
 };
