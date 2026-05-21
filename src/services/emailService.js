@@ -39,13 +39,28 @@ let provider = 'none';
 function getResend() {
   if (resendClient) return resendClient;
   if (!process.env.RESEND_API_KEY) return null;
+
+  // IMPORTANT: onboarding@resend.dev can ONLY deliver to the Resend account
+  // owner's email address. If RESEND_FROM is not set to a verified custom
+  // domain sender, skip Resend entirely and fall back to SMTP so OTPs reach
+  // ALL users (not just the Resend account owner).
+  const resendFrom = (process.env.RESEND_FROM || '').trim();
+  if (!resendFrom || resendFrom.includes('onboarding@resend.dev')) {
+    console.warn(
+      '[emailService] Resend skipped: RESEND_FROM is not set to a verified custom domain. ' +
+      'Using SMTP fallback so emails reach all users. ' +
+      'To use Resend, verify a domain at resend.com/domains and set RESEND_FROM.'
+    );
+    return null;
+  }
+
   if (!Resend) {
     console.warn('[emailService] RESEND_API_KEY set but `resend` package not installed. Run: npm install resend');
     return null;
   }
   resendClient = new Resend(process.env.RESEND_API_KEY);
   provider = 'resend';
-  console.log('[emailService] Resend HTTPS provider initialized ✓');
+  console.log(`[emailService] Resend HTTPS provider initialized ✓ (from: ${resendFrom})`);
   return resendClient;
 }
 
@@ -60,13 +75,15 @@ function getSmtp() {
 
   if (!host || !user || !pass) return null;
 
-  const secure = port === 465;
-  console.log(`[emailService] SMTP transporter → host=${host} port=${port} secure=${secure} user=${user}`);
+  const secure = port === 465; // true for SSL (465), false for STARTTLS (587)
+  const requireTLS = !secure && port === 587; // force STARTTLS on port 587
+  console.log(`[emailService] SMTP transporter → host=${host} port=${port} secure=${secure} requireTLS=${requireTLS} user=${user}`);
 
   smtpTransporter = nodemailer.createTransport({
     host,
     port,
     secure,
+    requireTLS,   // forces STARTTLS upgrade on port 587 (Gmail)
     auth: { user, pass },
     tls: { rejectUnauthorized: false },
     connectionTimeout: 15000,

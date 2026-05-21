@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true },
     role: { type: String, default: 'employee' },
     designation: { type: String, default: 'Employee' },
-    email: { type: String, default: '' },
+    email: { type: String, default: '', lowercase: true, trim: true },
     phone: { type: String, default: '' },
     dob: { type: String, default: '' }, // DD-MM-YYYY or YYYY-MM-DD
     gender: { type: String, default: '' },

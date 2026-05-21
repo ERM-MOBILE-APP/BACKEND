@@ -12,9 +12,15 @@ const OTP_TTL_MS = 10 * 60 * 1000; // 10 min
 exports.login = async (req, res) => {
   const { userId, password } = req.body;
   try {
-    // userId field may contain either userId or email
+    // userId field may contain either a userId string or an email address.
+    // Use case-insensitive regex for email so users are found regardless of
+    // how their email was originally stored (mixed-case vs lowercase).
+    const emailNormalized = (userId || '').toLowerCase().trim();
     const user = await User.findOne({
-      $or: [{ userId }, { email: (userId || '').toLowerCase().trim() }],
+      $or: [
+        { userId: userId },
+        { email: { $regex: new RegExp(`^${emailNormalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+      ],
     });
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(401).json({ message: 'Invalid credentials' });
@@ -158,7 +164,13 @@ exports.resetPassword = async (req, res) => {
     if (decoded.type !== 'reset')
       return res.status(400).json({ message: 'Invalid reset token' });
 
-    const user = await User.findOne({ email: decoded.email });
+    // Use case-insensitive regex so users are found even if their email was
+    // stored in mixed-case in the database.
+    const emailPattern = new RegExp(
+      `^${decoded.email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
+      'i'
+    );
+    const user = await User.findOne({ email: emailPattern });
     if (!user)
       return res.status(404).json({
         message: 'No account found for this email. Cannot reset password.',
@@ -166,6 +178,11 @@ exports.resetPassword = async (req, res) => {
 
     user.password = newPassword; // pre-save hook will hash
     await user.save();
+
+    // Also normalise the stored email to lowercase so future lookups are consistent
+    if (user.email !== decoded.email) {
+      await User.updateOne({ _id: user._id }, { $set: { email: decoded.email } });
+    }
 
     console.log(`[resetPassword] ✓ password updated for ${decoded.email}`);
     return res.json({ success: true, message: 'Password reset successful' });
