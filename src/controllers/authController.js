@@ -61,15 +61,25 @@ exports.sendOtp = async (req, res) => {
       });
     }
 
-    // email failed — surface devOtp in non-prod so user can still test
+    // email failed — return 502 so the frontend treats this as an error.
+    // ALWAYS surface the actual reason so it's debuggable from the mobile app.
     console.error('[sendOtp] email send failed:', result.error);
-    return res.status(200).json({
-      success: true,
+    const reason = result.error || 'Unknown SMTP error';
+    const hint = /not configured/i.test(reason)
+      ? 'SMTP environment variables are missing on the server. The admin must add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS on Render → Environment.'
+      : /invalid login|535|auth/i.test(reason)
+      ? 'SMTP credentials are wrong. Regenerate the Gmail App Password at myaccount.google.com/apppasswords and update SMTP_PASS on Render.'
+      : /timeout|ETIMEDOUT|ECONN/i.test(reason)
+      ? 'SMTP host is unreachable. Check SMTP_HOST/SMTP_PORT — try port 465 with SSL.'
+      : 'Check Render logs for [emailService] details.';
+
+    return res.status(502).json({
+      success: false,
       emailSent: false,
-      message:
-        process.env.NODE_ENV === 'production'
-          ? 'OTP generated but email delivery failed. Please contact admin.'
-          : `Email failed: ${result.error}. Dev OTP returned in devOtp field.`,
+      message: `Couldn't send OTP email. ${reason}. ${hint}`,
+      reason,
+      hint,
+      // expose otp ONLY outside production so devs can test the next step
       ...(process.env.NODE_ENV !== 'production' && { devOtp: otp }),
     });
   } catch (err) {
