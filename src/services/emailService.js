@@ -1,118 +1,128 @@
 /**
- * Email service — sends OTPs via Resend (HTTPS) or SMTP (Gmail).
+ * Email service — sends OTPs via Twilio SendGrid (HTTPS API).
  *
- * On Render free tier, outbound SMTP to Gmail (ports 465/587) is often
- * blocked or throttled, causing connection timeouts. Resend uses an
- * HTTPS API on port 443 which is always allowed, so we prefer it when
- * RESEND_API_KEY is set.
+ * ─────────────────────────────────────────────────────────────────────────
+ * WHY SENDGRID
+ * ─────────────────────────────────────────────────────────────────────────
+ * Render free tier BLOCKS outbound SMTP (ports 25, 465, 587), so we must
+ * use an HTTPS-based provider on port 443. SendGrid (owned by Twilio) gives
+ * 100 free emails/day on a verified single sender — enough for password
+ * resets on a small team — and works out of the box on Render.
  *
- * Priority:
- *   1. Resend         (if RESEND_API_KEY set)
- *   2. SMTP/Gmail     (if SMTP_HOST/USER/PASS set)
- *   3. Console mock   (logs OTP to backend logs only)
+ * ─────────────────────────────────────────────────────────────────────────
+ * SETUP (one-time)
+ * ─────────────────────────────────────────────────────────────────────────
+ *  1. Create an account at https://signup.sendgrid.com
+ *  2. Verify a sender:
+ *       Settings → Sender Authentication → Verify a Single Sender
+ *       (e.g. tescodigitalproject2026@gmail.com)
+ *  3. Create an API key:
+ *       Settings → API Keys → Create API Key → Full Access
+ *  4. On Render → Environment, set:
+ *       SENDGRID_API_KEY    = SG.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ *       SENDGRID_FROM       = tescodigitalproject2026@gmail.com   (verified sender)
+ *       SENDGRID_FROM_NAME  = Tesco ERM                           (optional)
  *
- * RESEND ENV VARS:
- *   RESEND_API_KEY    – API key from https://resend.com/api-keys
- *   RESEND_FROM       – verified sender, e.g. "Tesco ERM <onboarding@resend.dev>"
- *                       (use onboarding@resend.dev for testing — works
- *                        out of the box, no domain verification needed)
- *
- * SMTP ENV VARS (fallback):
- *   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS
- *   SMTP_FROM (optional) / SMTP_FROM_NAME (optional)
+ * ─────────────────────────────────────────────────────────────────────────
+ * BEHAVIOR
+ * ─────────────────────────────────────────────────────────────────────────
+ *  - If SendGrid env vars are set    → email goes through SendGrid.
+ *  - If SendGrid env vars are missing → falls back to console-mock so dev
+ *                                       work can continue without keys
+ *                                       (OTP printed to server logs).
  */
 
-const nodemailer = require('nodemailer');
-let Resend;
-try {
-  Resend = require('resend').Resend;
-} catch (_) {
-  Resend = null; // resend not installed yet
-}
+const fs   = require('fs');
+const path = require('path');
 
-let smtpTransporter = null;
-let resendClient = null;
-let lastVerifyError = null;
 let provider = 'none';
 
-// ---------- Resend setup ----------
-function getResend() {
-  if (resendClient) return resendClient;
-  if (!process.env.RESEND_API_KEY) return null;
-
-  // IMPORTANT: onboarding@resend.dev can ONLY deliver to the Resend account
-  // owner's email address. If RESEND_FROM is not set to a verified custom
-  // domain sender, skip Resend entirely and fall back to SMTP so OTPs reach
-  // ALL users (not just the Resend account owner).
-  const resendFrom = (process.env.RESEND_FROM || '').trim();
-  if (!resendFrom || resendFrom.includes('onboarding@resend.dev')) {
-    console.warn(
-      '[emailService] Resend skipped: RESEND_FROM is not set to a verified custom domain. ' +
-      'Using SMTP fallback so emails reach all users. ' +
-      'To use Resend, verify a domain at resend.com/domains and set RESEND_FROM.'
-    );
-    return null;
-  }
-
-  if (!Resend) {
-    console.warn('[emailService] RESEND_API_KEY set but `resend` package not installed. Run: npm install resend');
-    return null;
-  }
-  resendClient = new Resend(process.env.RESEND_API_KEY);
-  provider = 'resend';
-  console.log(`[emailService] Resend HTTPS provider initialized ✓ (from: ${resendFrom})`);
-  return resendClient;
+// ─── Logo (read once on startup) ─────────────────────────────────────────────
+// Logo lives in backend/src/assets/logo.png (copied from frontend/assets/logo.png)
+// We embed it as an inline CID attachment so email clients (Gmail, Outlook,
+// Apple Mail) render it as a proper image instead of stripping a data URI.
+// The CID equals the filename so the same <img src="cid:logo.png"> tag works
+// across every provider we might add later.
+const LOGO_CID  = 'logo.png';
+const LOGO_PATH = path.join(__dirname, '..', 'assets', 'logo.png');
+let   LOGO_BUFFER = null;
+let   LOGO_BASE64 = null;
+try {
+  LOGO_BUFFER = fs.readFileSync(LOGO_PATH);
+  LOGO_BASE64 = LOGO_BUFFER.toString('base64');
+  console.log(`[emailService] Logo loaded (${LOGO_BUFFER.length} bytes) from ${LOGO_PATH}`);
+} catch (err) {
+  console.warn(`[emailService] Logo NOT found at ${LOGO_PATH} — email will render without logo. (${err.message})`);
 }
 
-// ---------- SMTP setup ----------
-function getSmtp() {
-  if (smtpTransporter) return smtpTransporter;
-
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || 465);
-  const user = process.env.SMTP_USER;
-  const pass = (process.env.SMTP_PASS || '').replace(/\s+/g, '');
-
-  if (!host || !user || !pass) return null;
-
-  const secure = port === 465; // true for SSL (465), false for STARTTLS (587)
-  const requireTLS = !secure && port === 587; // force STARTTLS on port 587
-  console.log(`[emailService] SMTP transporter → host=${host} port=${port} secure=${secure} requireTLS=${requireTLS} user=${user}`);
-
-  smtpTransporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    requireTLS,   // forces STARTTLS upgrade on port 587 (Gmail)
-    auth: { user, pass },
-    tls: { rejectUnauthorized: false },
-    connectionTimeout: 15000,
-    socketTimeout: 20000,
-  });
-
-  smtpTransporter.verify((err) => {
-    if (err) {
-      lastVerifyError = err;
-      console.error('[emailService] SMTP verify FAILED:', err.message);
-    } else {
-      lastVerifyError = null;
-      console.log(`[emailService] SMTP ready ✓ — sending via ${host}:${port}`);
-    }
-  });
-
-  if (provider === 'none') provider = 'smtp';
-  return smtpTransporter;
+// ─── SendGrid (HTTPS — works on Render free tier) ───────────────────────────
+function hasSendGrid() {
+  return !!(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM);
 }
 
-// ---------- HTML template (shared) ----------
+async function sendViaSendGrid(toEmail, subject, html, text) {
+  const apiKey    = process.env.SENDGRID_API_KEY;
+  const fromEmail = (process.env.SENDGRID_FROM      || '').trim();
+  const fromName  = (process.env.SENDGRID_FROM_NAME || 'Tesco ERM').trim();
+
+  const payload = {
+    personalizations: [{ to: [{ email: toEmail }] }],
+    from:    { email: fromEmail, name: fromName },
+    subject,
+    content: [
+      { type: 'text/plain', value: text },
+      { type: 'text/html',  value: html },
+    ],
+  };
+
+  // Inline logo (CID) — the HTML references <img src="cid:logo.png">.
+  if (LOGO_BASE64) {
+    payload.attachments = [{
+      content:     LOGO_BASE64,
+      filename:    'logo.png',
+      type:        'image/png',
+      disposition: 'inline',
+      content_id:  LOGO_CID,
+    }];
+  }
+
+  // Use global fetch (Node 18+) — no extra dependency needed.
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  // SendGrid returns 202 Accepted with an empty body on success.
+  if (!res.ok) {
+    let errMsg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      // SendGrid error format: { errors: [{ message, field, help }] }
+      if (j.errors && j.errors.length)
+        errMsg = j.errors.map((e) => e.message).join('; ');
+      else errMsg = JSON.stringify(j);
+    } catch (_) {}
+    throw new Error(`SendGrid: ${errMsg}`);
+  }
+
+  return { messageId: res.headers.get('x-message-id') || 'queued' };
+}
+
+// ─── HTML template ───────────────────────────────────────────────────────────
 function buildHtml(otp, fromName) {
+  const logoSrc = LOGO_BASE64 ? `cid:${LOGO_CID}` : '';
+  const logoImg = logoSrc
+    ? `<img src="${logoSrc}" alt="${fromName}" width="180" style="display:block; max-width:180px; height:auto; margin:0 auto;" />`
+    : '';
+
   return `
   <div style="font-family: Arial, Helvetica, sans-serif; max-width:520px; margin:0 auto; padding:32px 24px; background:#f6f9f5; border-radius:12px;">
     <div style="text-align:center; padding-bottom:18px;">
-      <div style="display:inline-block; padding:10px 22px; background:#2E8C2C; border-radius:10px;">
-        <span style="color:#fff; font-size:22px; font-weight:800; letter-spacing:1.5px;">TESCO</span>
-        <div style="color:#dff5d8; font-size:10px; letter-spacing:4px; margin-top:2px;">ERM</div>
-      </div>
+      ${logoImg}
     </div>
 
     <div style="background:#ffffff; border-radius:10px; padding:28px 24px; box-shadow:0 4px 12px rgba(0,0,0,0.04);">
@@ -143,74 +153,47 @@ function buildHtml(otp, fromName) {
   `;
 }
 
-// ---------- Main send function ----------
+// ─── Main send function ───────────────────────────────────────────────────────
 async function sendOtpEmail(toEmail, otp) {
-  const fromName = (process.env.SMTP_FROM_NAME || 'Tesco ERM').trim();
-  const html = buildHtml(otp, fromName);
-  const subject = `Your Tesco ERM password reset code: ${otp}`;
-  const text = `Your Tesco ERM password reset OTP is ${otp}. It is valid for 10 minutes.`;
+  const fromName = (process.env.SENDGRID_FROM_NAME || 'Tesco ERM').trim();
+  const html     = buildHtml(otp, fromName);
+  const subject  = `Your Tesco ERM password reset code: ${otp}`;
+  const text     = `Your Tesco ERM OTP is ${otp}. Valid for 10 minutes. Do not share this code.`;
 
-  // ----- Try Resend first (HTTPS, works on Render free tier) -----
-  const resend = getResend();
-  if (resend) {
+  if (hasSendGrid()) {
     try {
-      const from = process.env.RESEND_FROM || `${fromName} <onboarding@resend.dev>`;
-      const { data, error } = await resend.emails.send({
-        from, to: toEmail, subject, html, text,
-      });
-      if (error) {
-        console.error('[emailService] Resend send FAILED:', error.message || error);
-        return { sent: false, error: `Resend: ${error.message || JSON.stringify(error)}`, provider: 'resend' };
-      }
-      console.log(`[emailService] ✓ Resend sent to ${toEmail} — id: ${data?.id}`);
-      return { sent: true, info: data, provider: 'resend' };
+      provider = 'sendgrid';
+      const data = await sendViaSendGrid(toEmail, subject, html, text);
+      console.log(`[emailService] ✓ SendGrid → ${toEmail} (messageId: ${data?.messageId})`);
+      return { sent: true, info: data, provider: 'sendgrid' };
     } catch (err) {
-      console.error('[emailService] Resend exception:', err.message);
-      // fall through to SMTP fallback
+      console.error('[emailService] SendGrid FAILED:', err.message);
+      return { sent: false, error: err.message, provider: 'sendgrid' };
     }
   }
 
-  // ----- Fall back to SMTP -----
-  const tx = getSmtp();
-  if (!tx) {
-    console.log(`[emailService] (mock) no provider configured — OTP for ${toEmail} = ${otp}`);
-    return {
-      sent: false,
-      error: 'No email provider configured (RESEND_API_KEY or SMTP_HOST/USER/PASS)',
-      provider: 'none',
-    };
-  }
-
-  const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER;
-  try {
-    const info = await tx.sendMail({
-      from: `"${fromName}" <${fromAddr}>`,
-      to: toEmail, subject, text, html,
-    });
-    console.log(`[emailService] ✓ SMTP sent to ${toEmail} — messageId: ${info.messageId}`);
-    return { sent: true, info, provider: 'smtp' };
-  } catch (err) {
-    console.error('[emailService] ✗ SMTP send FAILED:', err.message);
-    return { sent: false, error: err.message, provider: 'smtp' };
-  }
+  // No provider configured — log the OTP so dev can still test the flow.
+  console.error(
+    `[emailService] SendGrid not configured — OTP for ${toEmail} = ${otp}` +
+    '\n  → Set SENDGRID_API_KEY + SENDGRID_FROM on Render (signup.sendgrid.com)'
+  );
+  return {
+    sent:  false,
+    error: 'Email provider not configured. Set SENDGRID_API_KEY + SENDGRID_FROM on Render.',
+    provider: 'none',
+  };
 }
 
+// ─── Status endpoint ─────────────────────────────────────────────────────────
 function getStatus() {
   return {
     activeProvider: provider,
-    resend: {
-      configured: !!process.env.RESEND_API_KEY,
-      hasFrom: !!process.env.RESEND_FROM,
-    },
-    smtp: {
-      hasTransporter: !!smtpTransporter,
-      lastVerifyError: lastVerifyError ? lastVerifyError.message : null,
-      config: {
-        host: process.env.SMTP_HOST || null,
-        port: Number(process.env.SMTP_PORT || 465),
-        user: process.env.SMTP_USER || null,
-        hasPass: !!process.env.SMTP_PASS,
-      },
+    sendgrid: {
+      configured: hasSendGrid(),
+      hasApiKey:  !!process.env.SENDGRID_API_KEY,
+      hasFrom:    !!process.env.SENDGRID_FROM,
+      from:       process.env.SENDGRID_FROM || null,
+      fromName:   process.env.SENDGRID_FROM_NAME || null,
     },
   };
 }

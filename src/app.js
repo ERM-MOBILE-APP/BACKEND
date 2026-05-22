@@ -21,6 +21,7 @@ app.use('/api/profile', require('./routes/profile'));
 app.use('/api/payslip', require('./routes/payslip'));
 app.use('/api/announcement', require('./routes/announcement'));
 app.use('/api/notification', require('./routes/notification'));
+app.use('/api/complaint',    require('./routes/complaint'));
 
 app.get('/', (req, res) => {
   res.json({

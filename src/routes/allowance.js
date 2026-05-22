@@ -8,8 +8,16 @@ const {
   getById,
   updateStatus,
   cancel,
+  adminListAll,
+  adminUpdate,
 } = require('../controllers/allowanceController');
 
+// ─── HR / admin (x-admin-secret — for HRMS web app backend proxy) ─────
+// MUST come BEFORE the /:id employee routes so 'admin' isn't read as id.
+router.get  ('/admin/all', adminListAll);
+router.patch('/admin/:id', adminUpdate);
+
+// ─── Employee (JWT) ─────────────────────────────────────────────────────
 router.post('/submit', auth, submitAllowance);
 router.get('/my', auth, getMyAllowances);
 router.get('/summary', auth, getSummary);

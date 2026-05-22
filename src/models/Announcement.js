@@ -16,6 +16,10 @@ const announcementSchema = new mongoose.Schema(
       default: 'all',
     },
     isActive: { type: Boolean, default: true },
+    // When this row came from an HRMS-posted announcement, externalId stores
+    // the HRMS document _id so subsequent updates / deletes from HRMS can
+    // find and refresh the right mobile row instead of duplicating.
+    externalId: { type: String, default: null, index: true, sparse: true },
   },
   { timestamps: true }
 );

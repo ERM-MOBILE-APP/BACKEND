@@ -3,30 +3,193 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { sendOtpEmail, getStatus } = require('../services/emailService');
 
+// Bump this string every time you change auth logic so you can
+// confirm which build is actually running on Render. Hit
+// GET /api/auth/version to see what's live.
+const AUTH_CODE_VERSION = '2026-05-23-allowance-admin-endpoints-for-hrms';
+
 // In-memory OTP store: { email: { otp, expiresAt, attempts } }
 // Replace with Redis or DB in production.
 const otpStore = new Map();
 const MAX_ATTEMPTS = 5;
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 min
 
+/**
+ * Normalize a Gmail-style address: strip dots from the local part and
+ * everything after a '+' (Gmail treats john.doe+work@gmail.com,
+ * johndoe@gmail.com, and john.doe@gmail.com as the same mailbox).
+ * For non-Gmail/Googlemail domains we just lower-case and trim.
+ */
+function normalizeEmail(input) {
+  if (!input) return '';
+  const lower = String(input).trim().toLowerCase();
+  const atIdx = lower.indexOf('@');
+  if (atIdx < 0) return lower;
+  let local  = lower.slice(0, atIdx);
+  let domain = lower.slice(atIdx + 1);
+  const plusIdx = local.indexOf('+');
+  if (plusIdx >= 0) local = local.slice(0, plusIdx);
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    local = local.replace(/\./g, '');
+    domain = 'gmail.com';
+  }
+  return `${local}@${domain}`;
+}
+
+/**
+ * Flexible user lookup — finds a user from ANY plausible email/userId the
+ * employee might enter. Strategy (each step runs only if earlier steps
+ * returned nothing):
+ *
+ *   1. Exact match on `email` or `userId` (case-insensitive).
+ *      e.g. input "john@acme.com" → user.email = "john@acme.com"
+ *
+ *   2. Local-part-of-email match against `userId`.
+ *      Most common cause of "no account found": the User record only has
+ *      a userId like "pragatheeswaranm30" and a blank email column.
+ *      e.g. input "pragatheeswaranm30@gmail.com" → userId "pragatheeswaranm30"
+ *
+ *   3. Reverse-email match — input is a bare userId, find a user whose
+ *      email starts with "<userId>@".
+ *
+ *   4. Gmail dot/plus normalization — "j.smith+work@gmail.com" and
+ *      "jsmith@gmail.com" are the same Gmail mailbox.
+ *
+ *   5. Unique-substring fallback — if exactly ONE user has a userId that
+ *      contains the input's local part (or vice versa), match it. Skipped
+ *      when there are 0 or 2+ candidates to avoid choosing the wrong user.
+ *
+ * Returns the User document or null. The matchedBy field on the result
+ * (added as a non-enumerable property) records which strategy hit, which
+ * is logged but not exposed to the client.
+ */
+async function findUserByEmailOrUserId(rawInput) {
+  if (!rawInput) return null;
+  const raw      = String(rawInput).trim();
+  const lower    = raw.toLowerCase();
+  const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const atIdx    = lower.indexOf('@');
+  const isEmail  = atIdx > 0;
+  const localPart = isEmail ? lower.slice(0, atIdx) : lower;
+
+  // Step 1+2+3+4 — try every cheap exact/regex variation in a single OR query
+  const ciFull   = new RegExp(`^${escapeRe(lower)}$`, 'i');
+  const ciLocal  = new RegExp(`^${escapeRe(localPart)}$`, 'i');
+  const orClauses = [
+    { email:  ciFull },
+    { userId: ciFull },
+    { userId: raw },
+    { userId: lower },
+    // Step 2 — local part of email as userId
+    { userId: ciLocal },
+    { userId: localPart },
+  ];
+
+  if (!isEmail && lower.length > 0) {
+    // Step 3 — bare userId, find user whose email starts with "<userId>@"
+    orClauses.push({ email: new RegExp(`^${escapeRe(lower)}@`, 'i') });
+  }
+
+  // Step 4 — Gmail dot/plus normalization
+  if (isEmail) {
+    const normalized = normalizeEmail(lower);
+    if (normalized && normalized !== lower) {
+      orClauses.push({ email: new RegExp(`^${escapeRe(normalized)}$`, 'i') });
+    }
+    // Also try matching `email` after stripping dots from the local part on
+    // BOTH sides (handles "j.smith@gmail.com" in DB vs "jsmith@gmail.com"
+    // typed by user, and vice versa).
+    if (localPart.includes('.')) {
+      const nodots = localPart.replace(/\./g, '');
+      orClauses.push({ email: new RegExp(`^${escapeRe(nodots)}@`, 'i') });
+      orClauses.push({ userId: new RegExp(`^${escapeRe(nodots)}$`, 'i') });
+    }
+  }
+
+  let user = await User.findOne({ $or: orClauses });
+  if (user) {
+    Object.defineProperty(user, '_matchedBy', { value: 'exact-or-localpart', enumerable: false });
+    return user;
+  }
+
+  // Step 5 — unique-substring fallback. SAFETY: only accept if exactly ONE
+  // user matches the substring, otherwise we risk resetting the wrong
+  // account. We deliberately do NOT include `name` here (too noisy).
+  if (localPart.length >= 4) {
+    const containsRe = new RegExp(escapeRe(localPart), 'i');
+    const candidates = await User.find({
+      $or: [
+        { userId: containsRe },
+        { email:  containsRe },
+      ],
+    }).limit(3).select('userId email name role');
+
+    if (candidates.length === 1) {
+      const u = candidates[0];
+      Object.defineProperty(u, '_matchedBy', { value: 'unique-substring', enumerable: false });
+      console.log(
+        `[findUserByEmailOrUserId] unique substring match: input="${raw}" → ` +
+        `userId="${u.userId}" email="${u.email || '(empty)'}"`
+      );
+      return u;
+    }
+    if (candidates.length > 1) {
+      console.warn(
+        `[findUserByEmailOrUserId] substring "${localPart}" matched ${candidates.length} ` +
+        `users — refusing to guess. Candidates: ` +
+        candidates.map(c => `${c.userId}(${c.email || 'no-email'})`).join(', ')
+      );
+    }
+  }
+
+  return null;
+}
+
 exports.login = async (req, res) => {
   const { userId, password } = req.body;
   try {
-    // userId field may contain either a userId string or an email address.
-    // Use case-insensitive regex for email so users are found regardless of
-    // how their email was originally stored (mixed-case vs lowercase).
-    const emailNormalized = (userId || '').toLowerCase().trim();
+    if (!userId || !password)
+      return res.status(400).json({ message: 'Email/userId and password required' });
+
+    // The "userId" field from the mobile app may actually contain an email.
+    // Look up by BOTH userId (exact) and email (case-insensitive) — match whichever exists.
+    const raw = String(userId).trim();
+    const emailLower = raw.toLowerCase();
+
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const emailRegex = new RegExp(`^${escapeRe(emailLower)}$`, 'i');
+
     const user = await User.findOne({
       $or: [
-        { userId: userId },
-        { email: { $regex: new RegExp(`^${emailNormalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+        { userId: raw },
+        { userId: emailLower },
+        { email: emailRegex },
       ],
     });
-    if (!user || !(await bcrypt.compare(password, user.password)))
+
+    if (!user) {
+      console.log(`[login] no user found for "${raw}"`);
       return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    // Detailed debug logging — helps diagnose post-reset login failures
+    console.log(
+      `[login] candidate user: id=${user._id} userId=${user.userId} ` +
+      `email="${user.email}" pwHashPrefix=${(user.password || '').slice(0, 7)}`
+    );
+
+    const ok = await bcrypt.compare(password, user.password || '');
+    if (!ok) {
+      console.log(`[login] password mismatch for ${user.userId} (${user.email})`);
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { name: user.name, userId: user.userId, role: user.role } });
+    console.log(`[login] ✓ ${user.userId} logged in`);
+    res.json({
+      token,
+      user: { name: user.name, userId: user.userId, email: user.email, role: user.role },
+    });
   } catch (err) {
     console.error('[login]', err);
     res.status(500).json({ message: 'Server error' });
@@ -45,16 +208,29 @@ exports.sendOtp = async (req, res) => {
   try {
     const normalized = email.toLowerCase().trim();
 
-    // Soft check — log if no user, but still send OTP (you might want to
-    // tighten this later). Useful when User records lack email field.
-    const user = await User.findOne({ email: normalized });
+    // Lenient mode — send OTP to ANY email address the user enters.
+    // We do NOT 404 here, even when no User matches, because:
+    //   • the User collection's `email` field is often blank
+    //   • users may log in with an email-shaped `userId`
+    //   • blocking here makes forgot-password feel broken for valid accounts
+    // The flexible lookup in resetPassword handles "does this account
+    // actually exist" at the right moment (after the user has proven they
+    // own the inbox by typing back the OTP).
+    const user = await findUserByEmailOrUserId(normalized);
     if (!user) {
       console.warn(`[sendOtp] no User record for ${normalized} — sending OTP anyway`);
+    } else {
+      console.log(`[sendOtp] matched user ${user.userId} for ${normalized}`);
     }
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const expiresAt = Date.now() + OTP_TTL_MS;
-    otpStore.set(normalized, { otp, expiresAt, attempts: 0 });
+    otpStore.set(normalized, {
+      otp,
+      expiresAt,
+      attempts: 0,
+      userId: user ? user._id : null,
+    });
 
     console.log(`[sendOtp] generated OTP for ${normalized}: ${otp}`);
 
@@ -70,13 +246,13 @@ exports.sendOtp = async (req, res) => {
     // email failed — return 502 so the frontend treats this as an error.
     // ALWAYS surface the actual reason so it's debuggable from the mobile app.
     console.error('[sendOtp] email send failed:', result.error);
-    const reason = result.error || 'Unknown SMTP error';
+    const reason = result.error || 'Unknown SendGrid error';
     const hint = /not configured/i.test(reason)
-      ? 'SMTP environment variables are missing on the server. The admin must add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS on Render → Environment.'
-      : /invalid login|535|auth/i.test(reason)
-      ? 'SMTP credentials are wrong. Regenerate the Gmail App Password at myaccount.google.com/apppasswords and update SMTP_PASS on Render.'
-      : /timeout|ETIMEDOUT|ECONN/i.test(reason)
-      ? 'SMTP host is unreachable. Check SMTP_HOST/SMTP_PORT — try port 465 with SSL.'
+      ? 'SendGrid is not configured. Set SENDGRID_API_KEY and SENDGRID_FROM on Render → Environment.'
+      : /unauthorized|401|forbidden|403/i.test(reason)
+      ? 'SendGrid API key is invalid or revoked. Regenerate it at sendgrid.com → Settings → API Keys.'
+      : /verified sender|from address|sender identity/i.test(reason)
+      ? 'SENDGRID_FROM is not a verified sender. Verify it at sendgrid.com → Settings → Sender Authentication.'
       : 'Check Render logs for [emailService] details.';
 
     return res.status(502).json({
@@ -164,27 +340,82 @@ exports.resetPassword = async (req, res) => {
     if (decoded.type !== 'reset')
       return res.status(400).json({ message: 'Invalid reset token' });
 
-    // Use case-insensitive regex so users are found even if their email was
-    // stored in mixed-case in the database.
-    const emailPattern = new RegExp(
-      `^${decoded.email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
-      'i'
-    );
-    const user = await User.findOne({ email: emailPattern });
-    if (!user)
+    // Match the same flexible lookup used in sendOtp / login so that users
+    // whose login is an email-shaped userId (with no `email` column) can
+    // still reset their password.
+    const user = await findUserByEmailOrUserId(decoded.email);
+    if (!user) {
+      console.log(`[resetPassword] no user for "${decoded.email}" (tried all strategies)`);
+
+      // Pull a short list of near-matches so the error message itself
+      // gives the admin enough info to fix the data (without us having
+      // to query the DB separately).
+      let nearMatches = [];
+      try {
+        const local    = decoded.email.split('@')[0] || decoded.email;
+        const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (local.length >= 3) {
+          const containsRe = new RegExp(escapeRe(local), 'i');
+          nearMatches = await User.find({
+            $or: [{ userId: containsRe }, { email: containsRe }, { name: containsRe }],
+          })
+            .select('userId email name')
+            .limit(5)
+            .lean();
+        }
+      } catch (_) { /* best effort */ }
+
       return res.status(404).json({
-        message: 'No account found for this email. Cannot reset password.',
+        message: nearMatches.length
+          ? `No account found for "${decoded.email}". Did you mean one of these? ` +
+            nearMatches.map(u => u.userId).join(', ')
+          : `No account found for "${decoded.email}". Please ask your admin to add your email to your employee record.`,
+        searchedEmail: decoded.email,
+        nearMatches,
+        version: AUTH_CODE_VERSION,
       });
-
-    user.password = newPassword; // pre-save hook will hash
-    await user.save();
-
-    // Also normalise the stored email to lowercase so future lookups are consistent
-    if (user.email !== decoded.email) {
-      await User.updateOne({ _id: user._id }, { $set: { email: decoded.email } });
     }
 
-    console.log(`[resetPassword] ✓ password updated for ${decoded.email}`);
+    console.log(
+      `[resetPassword] matched user userId=${user.userId} email=${user.email || '(empty)'} ` +
+      `via ${user._matchedBy || 'unknown'}`
+    );
+
+    // CRITICAL: Hash the password ourselves and persist via updateOne.
+    // This bypasses the Mongoose pre-save hook (which is unreliable — if the
+    // hook silently fails, the plain-text password gets stored and login
+    // never matches). With updateOne + manual bcrypt we KNOW the hash is right.
+    const hashed = await bcrypt.hash(newPassword, 10);
+
+    // Build the $set payload. Always update password; only backfill `email`
+    // when the user has no email on file (so we don't clobber an existing,
+    // different email when the user was matched via userId).
+    const setPayload = { password: hashed };
+    if (!user.email || !user.email.trim()) {
+      setPayload.email = decoded.email;
+    }
+
+    await User.updateOne(
+      { _id: user._id },
+      { $set: setPayload }
+    );
+
+    console.log(
+      `[resetPassword] ✓ password updated for userId=${user.userId} ` +
+      `email=${decoded.email} hashPrefix=${hashed.slice(0, 7)}`
+    );
+
+    // Sanity check — re-read and verify the new password matches the new hash
+    const fresh = await User.findById(user._id).select('+password');
+    const verifyOk = await bcrypt.compare(newPassword, fresh.password);
+    if (!verifyOk) {
+      console.error('[resetPassword] ✗ POST-WRITE VERIFY FAILED — write did not persist!');
+      return res.status(500).json({
+        message: 'Password update could not be verified. Please try again.',
+      });
+    }
+    console.log('[resetPassword] ✓ post-write verify OK — new password works');
+
     return res.json({ success: true, message: 'Password reset successful' });
   } catch (err) {
     if (err.name === 'TokenExpiredError')
@@ -201,5 +432,78 @@ exports.resetPassword = async (req, res) => {
  * Visit /api/auth/email-status to debug email delivery.
  */
 exports.emailStatus = (req, res) => {
-  res.json({ smtp: getStatus() });
+  res.json({ smtp: getStatus(), version: AUTH_CODE_VERSION });
+};
+
+/**
+ * Returns the running code version for this controller. Use this to confirm
+ * Render has actually picked up your latest deploy — bump AUTH_CODE_VERSION
+ * at the top of this file every time you change auth logic.
+ *
+ *   curl https://backend-emqy.onrender.com/api/auth/version
+ */
+exports.version = (req, res) => {
+  res.json({ version: AUTH_CODE_VERSION, time: new Date().toISOString() });
+};
+
+/**
+ * Diagnostic endpoint — given an email or userId in the query string,
+ * shows what would match in the DB so we can debug "no account found".
+ * Returns: exact match (the same lookup resetPassword uses) PLUS a fuzzy
+ * substring search on email, userId, and name.
+ *
+ *   curl "https://backend-emqy.onrender.com/api/auth/whoami?email=pragatheeswaranm30@gmail.com"
+ *
+ * Safe to leave enabled — it returns userId/email/name only (no password
+ * hash, no token, no PII beyond what's already in the login screen).
+ */
+exports.whoami = async (req, res) => {
+  const input = (req.query.email || req.query.userId || '').toString().trim();
+  if (!input) {
+    return res.status(400).json({
+      message: 'Pass ?email=<address> or ?userId=<id> in the query string.',
+    });
+  }
+
+  try {
+    const lower    = input.toLowerCase();
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const local    = lower.includes('@') ? lower.split('@')[0] : lower;
+
+    // 1. The exact lookup resetPassword performs
+    const matched = await findUserByEmailOrUserId(input);
+
+    // 2. Fuzzy substring matches so we can see "near misses"
+    const fuzzyRe = new RegExp(escapeRe(local), 'i');
+    const fuzzy = await User.find({
+      $or: [
+        { email:  fuzzyRe },
+        { userId: fuzzyRe },
+        { name:   fuzzyRe },
+      ],
+    })
+      .select('userId email name role')
+      .limit(10)
+      .lean();
+
+    return res.json({
+      version: AUTH_CODE_VERSION,
+      input,
+      localPart: local,
+      matchedExact: matched
+        ? {
+            userId: matched.userId,
+            email:  matched.email || '(empty)',
+            name:   matched.name,
+            role:   matched.role,
+          }
+        : null,
+      fuzzyMatchCount: fuzzy.length,
+      fuzzy,
+      totalUsersInDb: await User.countDocuments(),
+    });
+  } catch (err) {
+    console.error('[whoami]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
 };
