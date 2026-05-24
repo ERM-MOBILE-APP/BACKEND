@@ -106,7 +106,7 @@ exports.adminListAll = async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
 
     const items = await Complaint.find(q)
-      .populate('user', 'userId name email designation photoUrl')
+      .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
@@ -169,7 +169,7 @@ exports.adminUpdate = async (req, res) => {
     if (!prev) return res.status(404).json({ message: 'Complaint not found.' });
 
     const fresh = await Complaint.findByIdAndUpdate(id, update, { new: true })
-      .populate('user', 'userId name email designation photoUrl');
+      .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName');
 
     try {
       const statusChanged = update.status     && update.status !== prev.status;

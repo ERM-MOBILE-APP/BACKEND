@@ -132,7 +132,7 @@ exports.getMyLeaves = async (req, res) => {
 exports.getAllLeaves = async (req, res) => {
   try {
     const leaves = await Leave.find()
-      .populate('user', 'name userId')
+      .populate('user', 'name userId designation department designationTitle departmentName')
       .sort({ createdAt: -1 });
     res.json(leaves);
   } catch (err) {
@@ -229,7 +229,7 @@ exports.adminListAll = async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
 
     const items = await Leave.find(q)
-      .populate('user', 'userId name email designation photoUrl')
+      .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
@@ -289,7 +289,7 @@ exports.adminUpdate = async (req, res) => {
     if (typeof reviewedBy === 'string') update.reviewedBy = reviewedBy;
 
     const fresh = await Leave.findByIdAndUpdate(req.params.id, update, { new: true })
-      .populate('user', 'userId name email designation photoUrl');
+      .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName');
 
     // Fire notification on real status transition (approved or rejected).
     try {

@@ -2,11 +2,12 @@ const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { sendOtpEmail, getStatus } = require('../services/emailService');
+const { computeLeavePolicy } = require('../utils/leavePolicy');
 
 // Bump this string every time you change auth logic so you can
 // confirm which build is actually running on Render. Hit
 // GET /api/auth/version to see what's live.
-const AUTH_CODE_VERSION = '2026-05-23-allowance-admin-endpoints-for-hrms';
+const AUTH_CODE_VERSION = '2026-05-24-presence-location-tracking';
 
 // In-memory OTP store: { email: { otp, expiresAt, attempts } }
 // Replace with Redis or DB in production.
@@ -159,11 +160,17 @@ exports.login = async (req, res) => {
     const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const emailRegex = new RegExp(`^${escapeRe(emailLower)}$`, 'i');
 
+    // Unified collection: docs use HRMS field names — `employeeId` not
+    // `userId`. The User model exposes `userId` only as a virtual, which
+    // doesn't match in queries. So we look up by physical fields:
+    // employeeId (HRMS canonical), email (case-insensitive), and username
+    // (HRMS sets this when admin creates).
     const user = await User.findOne({
       $or: [
-        { userId: raw },
-        { userId: emailLower },
+        { employeeId: raw },
+        { employeeId: emailLower },
         { email: emailRegex },
+        { username: emailLower },
       ],
     });
 
@@ -504,6 +511,294 @@ exports.whoami = async (req, res) => {
     });
   } catch (err) {
     console.error('[whoami]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * POST /api/auth/change-password    (JWT-protected)
+ * Body: { oldPassword, newPassword }
+ *
+ * Lets a logged-in mobile employee rotate the password HR initially gave
+ * them. Verifies oldPassword against the stored hash, then re-hashes and
+ * stores newPassword. No OTP required since they're already authenticated.
+ */
+exports.changePassword = async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body || {};
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ message: 'Provide oldPassword and newPassword.' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ message: 'New password must be at least 6 characters.' });
+    }
+    const user = await User.findById(req.user.id);
+    if (!user || !user.password) {
+      return res.status(404).json({ message: 'Account not found.' });
+    }
+    const ok = await bcrypt.compare(String(oldPassword), user.password);
+    if (!ok) {
+      return res.status(401).json({ message: 'Current password is wrong.' });
+    }
+    user.password = String(newPassword);   // pre-save hook will hash it
+    await user.save();
+    console.log(`[changePassword] ✓ ${user.email || user.employeeId} updated their password`);
+    return res.json({ message: 'Password updated. Use the new password next time you sign in.' });
+  } catch (err) {
+    console.error('[changePassword]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════════
+// ADMIN USER-MANAGEMENT ENDPOINTS (consumed by the HRMS web app)
+//
+// All require the x-admin-secret header. The secret comes from the
+// ADMIN_SECRET env var on Render. Without it, every endpoint returns 503.
+// ════════════════════════════════════════════════════════════════════════
+
+function checkAdmin(req, res) {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected) {
+    res.status(503).json({ message: 'ADMIN_SECRET is not configured on the server.' });
+    return false;
+  }
+  if (!got || got !== expected) {
+    res.status(401).json({ message: 'Missing or invalid x-admin-secret header.' });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * GET /api/auth/admin/users?q=<search>&limit=50
+ * Search by userId / name / email (case-insensitive substring). Returns
+ * { users, total, shown }.
+ */
+exports.adminListUsers = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const q     = (req.query.q || '').toString().trim();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 500);
+
+    let filter = {};
+    if (q) {
+      const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(escapeRe(q), 'i');
+      filter = { $or: [{ userId: re }, { name: re }, { email: re }] };
+    }
+    const [users, total] = await Promise.all([
+      User.find(filter).select('-password').sort({ createdAt: -1 }).limit(limit).lean(),
+      User.countDocuments(filter),
+    ]);
+    res.json({ users, total, shown: users.length });
+  } catch (err) {
+    console.error('[adminListUsers]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * GET /api/auth/admin/users/:userId
+ * Returns the FULL user document (password excluded).
+ */
+exports.adminGetUser = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const userId = req.params.userId;
+    const user = await User.findOne({ userId }).select('-password').lean();
+    if (!user) return res.status(404).json({ message: `No user with userId "${userId}".` });
+    const fieldsStored = Object.keys(user).filter((k) => !['_id', '__v'].includes(k));
+    res.json({ user, fieldsStored });
+  } catch (err) {
+    console.error('[adminGetUser]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * POST /api/auth/admin/users
+ * Body: { userId, name, password, email?, phone?, role?, designation?, ... }
+ *
+ * Creates a User. IMPORTANT: passes the PLAINTEXT password to the model;
+ * the pre('save') hook hashes it exactly once. Manually hashing here AND
+ * letting the hook hash would double-hash and break login.
+ */
+exports.adminCreateUser = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const body = req.body || {};
+    const { userId, name, password } = body;
+
+    if (!userId || !name || !password) {
+      return res.status(400).json({
+        message: 'userId, name, and password are required.',
+      });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    }
+
+    const cleanUserId     = String(userId).trim();
+    const normalizedEmail = String(body.email || '').trim().toLowerCase();
+
+    const dupUserId = await User.findOne({ userId: cleanUserId });
+    if (dupUserId) {
+      return res.status(409).json({
+        message: `A user with userId "${cleanUserId}" already exists.`,
+        existing: { userId: dupUserId.userId, email: dupUserId.email, name: dupUserId.name },
+      });
+    }
+    if (normalizedEmail) {
+      const dupEmail = await User.findOne({ email: normalizedEmail });
+      if (dupEmail) {
+        return res.status(409).json({
+          message: `A user with email "${normalizedEmail}" already exists.`,
+          existing: { userId: dupEmail.userId, email: dupEmail.email, name: dupEmail.name },
+        });
+      }
+    }
+
+    const doc = {
+      userId:   cleanUserId,
+      name:     String(name).trim(),
+      password: String(password),         // plaintext — model pre('save') hashes
+      email:    normalizedEmail,
+    };
+    const stringFields = ['role', 'designation', 'phone', 'dob', 'gender',
+      'bloodGroup', 'photoUrl', 'address', 'status', 'workType'];
+    stringFields.forEach((f) => {
+      if (body[f] !== undefined && body[f] !== null) doc[f] = String(body[f]).trim();
+    });
+    const numberFields = ['leaveBalance', 'permissionBalance'];
+    numberFields.forEach((f) => {
+      if (body[f] !== undefined && body[f] !== null && body[f] !== '') {
+        const n = Number(body[f]);
+        if (!isNaN(n)) doc[f] = n;
+      }
+    });
+
+    const created = await User.create(doc);
+    const fresh   = await User.findById(created._id).select('-password').lean();
+
+    console.log(`[adminCreateUser] ✓ created userId=${created.userId} email=${created.email || '(empty)'}`);
+    return res.status(201).json({
+      message:      'User created.',
+      fieldsStored: Object.keys(fresh),
+      user:         fresh,
+    });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({
+        message: 'Duplicate key — userId or email must be unique.',
+        error:   err.message,
+      });
+    }
+    console.error('[adminCreateUser]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/auth/admin/users/:userId
+ * Whitelisted fields only. Password is re-hashed manually since updateOne
+ * doesn't fire the pre('save') hook.
+ */
+exports.adminUpdateUser = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const targetUserId = req.params.userId;
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ci = new RegExp(`^${escapeRe(targetUserId)}$`, 'i');
+    const user = await User.findOne({ userId: ci });
+    if (!user) return res.status(404).json({ message: `No user with userId "${targetUserId}".` });
+
+    const updates = {};
+    const stringFields = ['email', 'name', 'phone', 'role', 'designation', 'status',
+      'dob', 'gender', 'bloodGroup', 'photoUrl', 'address', 'workType'];
+    for (const f of stringFields) {
+      if (req.body[f] !== undefined) {
+        updates[f] = f === 'email'
+          ? String(req.body[f] || '').trim().toLowerCase()
+          : String(req.body[f] || '').trim();
+      }
+    }
+    const numberFields = ['leaveBalance', 'permissionBalance'];
+    for (const f of numberFields) {
+      if (req.body[f] !== undefined && req.body[f] !== '' && req.body[f] !== null) {
+        const n = Number(req.body[f]);
+        if (!isNaN(n)) updates[f] = n;
+      }
+    }
+    if (req.body.password !== undefined) {
+      if (String(req.body.password).length < 6) {
+        return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+      }
+      updates.password = await bcrypt.hash(String(req.body.password), 10);
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        message: 'No updatable fields supplied. Pass at least one of: ' +
+                 stringFields.concat(numberFields, 'password').join(', '),
+      });
+    }
+
+    if (updates.email) {
+      const other = await User.findOne({ email: updates.email, _id: { $ne: user._id } });
+      if (other) {
+        return res.status(409).json({
+          message: `Another user already has email "${updates.email}".`,
+          existing: { userId: other.userId, name: other.name },
+        });
+      }
+    }
+
+    await User.updateOne({ _id: user._id }, { $set: updates });
+    const fresh = await User.findById(user._id).select('-password');
+    console.log(`[adminUpdateUser] ✓ updated userId=${user.userId} fields=${Object.keys(updates).join(',')}`);
+    return res.json({ message: 'User updated.', user: fresh });
+  } catch (err) {
+    console.error('[adminUpdateUser]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * DELETE /api/auth/admin/users/:userId
+ */
+exports.adminDeleteUser = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const u = await User.findOneAndDelete({ userId: req.params.userId });
+    if (!u) return res.status(404).json({ message: `No user with userId "${req.params.userId}".` });
+    console.log(`[adminDeleteUser] ✓ deleted userId=${u.userId}`);
+    return res.json({ message: 'User deleted.', userId: u.userId });
+  } catch (err) {
+    console.error('[adminDeleteUser]', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * GET /api/auth/admin/users/:userId/leave-policy
+ * Returns this-month leave/permission usage + LOP for the user, using the
+ * same shared module as the mobile attendance/profile screens.
+ */
+exports.adminLeavePolicy = async (req, res) => {
+  if (!checkAdmin(req, res)) return;
+  try {
+    const user = await User.findOne({ userId: req.params.userId });
+    if (!user) return res.status(404).json({ message: `No user with userId "${req.params.userId}".` });
+
+    const now    = new Date();
+    const year   = parseInt(req.query.year,  10) || now.getFullYear();
+    const month1 = parseInt(req.query.month, 10) || (now.getMonth() + 1);
+    const policy = await computeLeavePolicy(user._id, year, month1 - 1);
+    return res.json(policy);
+  } catch (err) {
+    console.error('[adminLeavePolicy]', err);
     return res.status(500).json({ message: 'Server error', error: err.message });
   }
 };

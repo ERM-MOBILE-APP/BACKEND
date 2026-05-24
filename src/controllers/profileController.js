@@ -1,5 +1,50 @@
-const User = require('../models/User');
-const Leave = require('../models/Leave');
+const mongoose = require('mongoose');
+const User     = require('../models/User');
+const Leave    = require('../models/Leave');
+let Department, Designation;
+try { Department  = require('../models/Department');  } catch { Department  = null; }
+try { Designation = require('../models/Designation'); } catch { Designation = null; }
+
+const isObjId = (v) => v && /^[a-f0-9]{24}$/i.test(String(v));
+
+/**
+ * Resolve a possibly-ObjectId reference to a human label by looking it up
+ * in the matching collection. Falls back to the raw value (or '') when the
+ * ID doesn't resolve.
+ */
+async function resolveLabel(value, kind) {
+  if (!value) return '';
+  if (!isObjId(value)) return String(value);
+  try {
+    if (kind === 'dept' && Department) {
+      const d = await Department.findById(value).lean();
+      return d?.name || '';
+    }
+    if (kind === 'desig' && Designation) {
+      const d = await Designation.findById(value).lean();
+      return d?.title || '';
+    }
+    // Fall back to a raw `departments` / `designations` collection lookup
+    // when the Mongoose model isn't registered on the mobile backend.
+    const coll = kind === 'dept' ? 'departments' : 'designations';
+    const db   = mongoose.connection.db;
+    const doc  = await db.collection(coll).findOne({ _id: new mongoose.Types.ObjectId(value) });
+    return doc?.name || doc?.title || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Flatten an address object into "Street, City, State, Pincode, Country". */
+function flattenAddress(addr) {
+  if (!addr) return '';
+  if (typeof addr === 'string') return addr;
+  if (typeof addr === 'object') {
+    return [addr.street, addr.city, addr.state, addr.zipCode, addr.country]
+      .filter(Boolean).join(', ');
+  }
+  return String(addr);
+}
 
 const MONTHLY_LEAVE_ALLOWED = 1;
 const MONTHLY_PERMISSION_ALLOWED = 2;
@@ -63,8 +108,20 @@ exports.getProfile = async (req, res) => {
     const lopLeave = Math.max(0, leaveUsed - MONTHLY_LEAVE_ALLOWED);
     const lopPermission = Math.max(0, permissionUsed - MONTHLY_PERMISSION_ALLOWED);
 
+    // Translate ObjectId references to readable strings before the mobile
+    // UI gets them. Without this, Designation/Department/Address fields
+    // show raw hex or '[object Object]'.
+    const u = user.toObject();
+    const [deptLabel, desigLabel] = await Promise.all([
+      resolveLabel(u.department,  'dept'),
+      resolveLabel(u.designation, 'desig'),
+    ]);
+    u.department  = deptLabel;
+    u.designation = desigLabel;
+    u.address     = flattenAddress(u.address);
+
     res.json({
-      ...user.toObject(),
+      ...u,
       leaveBalance,
       permissionBalance,
       policy: {

@@ -22,6 +22,8 @@ app.use('/api/payslip', require('./routes/payslip'));
 app.use('/api/announcement', require('./routes/announcement'));
 app.use('/api/notification', require('./routes/notification'));
 app.use('/api/complaint',    require('./routes/complaint'));
+// Admin one-off maintenance (backfill emp id, etc.) — gated by x-admin-secret.
+app.use('/api/admin',        require('./routes/adminBackfill'));
 
 app.get('/', (req, res) => {
   res.json({

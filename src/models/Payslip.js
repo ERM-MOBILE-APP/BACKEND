@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 
+const stampEmployeeId = require('../utils/stampEmployeeId');
 const earningsSchema = new mongoose.Schema({
   basicSalary:       { type: Number, default: 0 },
   hraAllowance:      { type: Number, default: 0 },
@@ -17,6 +18,10 @@ const deductionsSchema = new mongoose.Schema({
 
 const payslipSchema = new mongoose.Schema({
   user:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    // EMP-ID-SIDECAR — duplicate of the user's human employee id (TES047)
+    // stored on every row so HR can read who a record belongs to without
+    // joining back to the employees collection.
+    employeeId: { type: String, default: '', index: true, trim: true, uppercase: true },
   month:       { type: Number, required: true },   // 1-12
   year:        { type: Number, required: true },
   monthLabel:  { type: String },                   // e.g. "May 2026"
@@ -31,5 +36,9 @@ const payslipSchema = new mongoose.Schema({
 
 // Unique payslip per employee per month/year
 payslipSchema.index({ user: 1, month: 1, year: 1 }, { unique: true });
+
+// Attach the EMP-ID auto-stamp plugin to the TOP-LEVEL payslipSchema
+// (not the earnings sub-schema — that one has no `user` field).
+payslipSchema.plugin(stampEmployeeId);
 
 module.exports = mongoose.model('Payslip', payslipSchema);
