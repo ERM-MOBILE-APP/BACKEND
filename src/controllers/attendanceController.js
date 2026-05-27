@@ -50,6 +50,37 @@ function haversineKm(a, b) {
 }
 
 /**
+ * Compact a polyline by dropping points that sit within `minStepM` metres
+ * of the previously-kept point. Always keeps the first and last samples
+ * so day-start / day-end markers stay accurate.
+ *
+ * Why this matters
+ * ────────────────
+ * A typical 8-hour shift produces 240+ pings (one every 2 min). When the
+ * employee is stationary (at a desk, in a meeting) consecutive samples
+ * differ only by GPS noise — usually < 10 m. Including all of them
+ * inflates the JSON payload by 5-10x without changing the visual route
+ * shape on the map at all. After simplification, a typical day's
+ * polyline drops from ~30 KB to ~5-10 KB, and the modal's first paint
+ * happens visibly faster.
+ *
+ * Returns the simplified array; safe on arrays < 2.
+ */
+function simplifyPolyline(points, minStepM = 10) {
+  if (!Array.isArray(points) || points.length < 3) return points || [];
+  const stepKm = minStepM / 1000;
+  const out = [points[0]];
+  for (let i = 1; i < points.length - 1; i++) {
+    const last = out[out.length - 1];
+    if (haversineKm(last, points[i]) >= stepKm) {
+      out.push(points[i]);
+    }
+  }
+  out.push(points[points.length - 1]);
+  return out;
+}
+
+/**
  * Build the canonical "day route" for one (user, date) — used by:
  *   • check-out, to stamp totalDistanceKm on the Attendance row
  *   • HRMS admin daily-route endpoint, to render the polyline + km
@@ -88,16 +119,23 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
     .lean();
 
   if (pings.length >= 2) {
+    // Sum the FULL ping list for accurate km — every micro-movement
+    // counts toward distance even if we won't render it. Then SIMPLIFY
+    // before serializing the polyline to keep the response payload small.
     let total = 0;
     for (let i = 1; i < pings.length; i++) {
       total += haversineKm(pings[i - 1], pings[i]);
     }
     const first = pings[0];
     const last  = pings[pings.length - 1];
+    const compact = simplifyPolyline(
+      pings.map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
+      10,   // metres — dropping noise-level deltas
+    );
     return {
       distanceKm: Math.round(total * 100) / 100,
       source:     'gps',
-      polyline:   pings.map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
+      polyline:   compact,
       from:       { lat: first.lat, lng: first.lng, at: first.recordedAt },
       to:         { lat: last.lat,  lng: last.lng,  at: last.recordedAt  },
     };
@@ -856,17 +894,16 @@ exports.adminLiveLocations = async (req, res) => {
       let site   = 'Last known location';
       if (lat != null && lng != null) {
         const ageMin = recordedAt ? (Date.now() - new Date(recordedAt).getTime()) / 60000 : 999;
-        // 20 min = up to 10 missed 2-minute pings. Generous enough to ride
-        // through:
-        //   • brief tunnels / elevators
-        //   • Android OEM battery-killing the foreground service for a
-        //     few minutes before the OS resurrects the task
-        //   • iOS aggressively suspending background location for power
-        // Before this was 12 min, which flipped users to Offline within
-        // minutes of backgrounding the app — looked wrong because the
-        // employee's GPS was still on, just the bg task hadn't pinged
-        // through OEM throttling yet.
-        const stale  = ageMin > 20;
+        // 25 min stale window. The mobile app now runs THREE redundant
+        // recovery layers:
+        //   • 30-sec foreground GPS watcher        (catches GPS toggles)
+        //   • 60-sec bg-task guardian              (catches OEM kills)
+        //   • OS-scheduled 2-min background pings  (the workhorse)
+        // 25 min = one full guardian-cycle of grace on top of the
+        // theoretical worst case (12 min OEM throttle + 2 min interval +
+        // network round-trip). If we hit it the task has genuinely been
+        // dead long enough that "Offline" is the honest label.
+        const stale  = ageMin > 25;
 
         if (!stale) {
           // ── FRESH PING WINS ────────────────────────────────────────

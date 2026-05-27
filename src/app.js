@@ -3,10 +3,16 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const compression = require('compression');
 const { startKeepAlive } = require('./keepAlive');
 
 const app = express();
 app.use(cors());
+// gzip every JSON response > 1 KB. The daily-route polyline is the
+// biggest payload the HRMS asks for (a few KB after simplification)
+// and gzips down to roughly 30% of that. Saves ~200-500 ms on the
+// HRMS-proxy round-trip, depending on the user's last-mile speed.
+app.use(compression({ threshold: 1024 }));
 app.use(express.json());
 
 mongoose.connect(process.env.MONGO_URI)
