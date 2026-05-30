@@ -639,9 +639,28 @@ exports.createRequest = async (req, res) => {
   }
 };
 
+// Auto-expire pending attendance requests older than 2 days. Runs on
+// every list call (cheap: indexed query, updateMany once) so HR doesn't
+// see a request that's effectively been ignored — and the employee can
+// re-file because the row is no longer "pending".
+async function closeStaleAttendanceRequests(filter = {}) {
+  const cutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  try {
+    await AttendanceRequest.updateMany(
+      { ...filter, status: 'pending', createdAt: { $lt: cutoff } },
+      { $set: { status: 'expired' } }
+    );
+  } catch (e) {
+    // Sweep failure is non-fatal — the list still returns, just with
+    // stale rows still marked pending. Log and move on.
+    console.warn('[attendance.request] sweep failed:', e.message);
+  }
+}
+
 // GET /api/attendance/requests
 exports.listRequests = async (req, res) => {
   try {
+    await closeStaleAttendanceRequests({ user: req.user.id });
     const items = await AttendanceRequest.find({ user: req.user.id })
       .sort({ createdAt: -1 })
       .lean();

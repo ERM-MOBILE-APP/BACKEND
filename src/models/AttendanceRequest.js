@@ -20,8 +20,11 @@ const attendanceRequestSchema = new mongoose.Schema(
     expectedCheckIn: { type: String, default: '' }, // "HH:mm"
     expectedCheckOut: { type: String, default: '' },
     status: {
+      // 'expired' is set automatically when a pending request has been
+      // sitting for 2+ days without HR action — keeps the queue from
+      // growing forever and matches the policy HR asked for.
       type: String,
-      enum: ['pending', 'approved', 'rejected'],
+      enum: ['pending', 'approved', 'rejected', 'expired'],
       default: 'pending',
     },
     reviewedBy: { type: String, default: '' },

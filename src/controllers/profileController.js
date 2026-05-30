@@ -176,3 +176,28 @@ exports.updateProfile = async (req, res) => {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
+
+
+/**
+ * GET /api/profile/assets
+ * Returns assets assigned to the signed-in employee by HRMS. Mirrors
+ * the ERM Web implementation so both apps surface the same data.
+ */
+exports.myAssets = async (req, res) => {
+  try {
+    const User  = require('../models/User');
+    const Asset = require('../models/Asset');
+    const me = await User.findById(req.user.id).select('employeeId userId').lean();
+    if (!me) return res.json({ success: true, items: [] });
+    const candidates = [me.employeeId, me.userId].filter(Boolean).map((s) => String(s).toUpperCase());
+    if (candidates.length === 0) return res.json({ success: true, items: [] });
+    const items = await Asset.find({
+      employeeId: { $in: candidates },
+      status:     { $nin: ['Retired', 'Lost'] },
+    }).sort({ issuedDate: -1 }).lean();
+    res.json({ success: true, items });
+  } catch (err) {
+    console.error('[profile.myAssets]', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
