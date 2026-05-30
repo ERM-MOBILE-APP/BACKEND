@@ -85,6 +85,18 @@ exports.applyPermission = async (req, res) => {
     if (!permissionType || !date || !startTime || !endTime || !reason) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
+    // Policy cap: each permission slot is at most 2 hours. Anything
+    // longer would functionally be half a workday — those need a
+    // proper Leave application, not a permission.
+    const hours = hoursBetween(startTime, endTime);
+    if (hours > 2 + 1e-6) {
+      return res.status(400).json({
+        message: 'Each permission can be at most 2 hours. Apply for a Leave (half-day) if you need longer.',
+      });
+    }
+    if (hours <= 0) {
+      return res.status(400).json({ message: 'End time must be after start time.' });
+    }
     const permission = await Leave.create({
       user: req.user.id,
       requestType: 'permission',
@@ -92,7 +104,7 @@ exports.applyPermission = async (req, res) => {
       date,
       startTime,
       endTime,
-      durationHours: hoursBetween(startTime, endTime),
+      durationHours: hours,
       reason,
     });
     res.status(201).json({ message: 'Permission applied successfully', permission });

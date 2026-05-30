@@ -38,6 +38,11 @@ const userSchema = new mongoose.Schema(
     // via its own Employee model's `select: false`.
     password:   { type: String, required: true },
     email:      { type: String, lowercase: true, trim: true, index: true },
+    // Mirrors HRMS Employee.emailHistory — every prior email this user has
+    // had, so login by an old address still resolves even when the HRMS
+    // edit briefly silently-fails or the user just doesn't remember which
+    // email is current.
+    emailHistory: { type: [String], default: [], index: true },
     phone:      { type: String, default: '' },
     address:    { type: mongoose.Schema.Types.Mixed }, // HRMS object OR mobile flat string
     department: { type: mongoose.Schema.Types.Mixed }, // HRMS ObjectId OR string

@@ -30,11 +30,33 @@ const allowanceSchema = new mongoose.Schema(
     amount: { type: Number, required: true },
     notes: { type: String, default: '' },
     receiptUrl: { type: String, default: '' },
-    status: {
+    // Manager-tier status — set by the assigned manager via ERM Web's
+    // /api/manager/leaves/:id or /api/manager/allowances/:id (the same
+    // shared DB doc is read by HRMS). Empty string means "Awaiting
+    // Manager" in the HRMS approval pages; 'Approved' enables the HR
+    // action buttons; 'Rejected' short-circuits HR review entirely.
+    managerStatus: {
+      type: String,
+      enum: ['', 'Approved', 'Rejected'],
+      default: '',
+    },
+    managerStatusBy:  { type: String, default: '' },   // manager's display name
+    managerStatusAt:  { type: Date,   default: null }, // when they acted
+        status: {
       type: String,
       enum: ['pending', 'approved', 'rejected'],
       default: 'pending',
     },
+    // HR review breakdown — the employee requests `amount`, but HR may
+    // approve only part of it after verifying the actual distance.
+    //   approvedAmount  → the ₹ that will be reimbursed
+    //   rejectedAmount  → amount − approvedAmount  (what HR struck off)
+    //   amountComment   → free-text note ("approved at 60% of claim because
+    //                      GPS shows shorter distance" etc.). Surfaced to
+    //                      the employee in the in-app notification.
+    approvedAmount: { type: Number, default: 0 },
+    rejectedAmount: { type: Number, default: 0 },
+    amountComment:  { type: String, default: '' },
     hrComment: { type: String, default: '' },
     reviewedBy: { type: String, default: '' },
     reviewedAt: { type: Date },

@@ -84,6 +84,8 @@ async function findUserByEmailOrUserId(rawInput) {
     // Step 2 — local part of email as userId
     { userId: ciLocal },
     { userId: localPart },
+    // Step 1b — any past email the HRMS edit pushed onto emailHistory.
+    { emailHistory: lower },
   ];
 
   if (!isEmail && lower.length > 0) {
@@ -122,6 +124,7 @@ async function findUserByEmailOrUserId(rawInput) {
       $or: [
         { userId: containsRe },
         { email:  containsRe },
+        { emailHistory: containsRe },
       ],
     }).limit(3).select('userId email name role');
 
@@ -171,6 +174,11 @@ exports.login = async (req, res) => {
         { employeeId: emailLower },
         { email: emailRegex },
         { username: emailLower },
+        // Match historical emails too. If HR edited the employee's email
+        // from X → Y and the mobile-side row didn't refresh (cold cache,
+        // stale tab, silent save failure on HRMS), the user can still
+        // log in with either the OLD or NEW address.
+        { emailHistory: emailLower },
       ],
     });
 

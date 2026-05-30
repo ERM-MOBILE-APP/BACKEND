@@ -181,12 +181,27 @@ exports.checkIn = async (req, res) => {
       return res.status(400).json({ message: 'Already checked in today' });
     }
 
-    // Late if check-in is past 10:01 AM local. Anyone clocking in at
+    // Late if check-in is past 10:01 AM IST. Anyone clocking in at
     // 10:01 or later is flagged late; the cumulative late count then
     // drives the half-day / full-day LOP rule in the leave policy calc.
+    //
+    // CRITICAL: the host (Render free-tier) runs in UTC. Using
+    // now.getHours() returned UTC hours, so a 10:01 IST check-in showed
+    // up at 04:31 UTC → 4, which is < 10, so isLate was ALWAYS false on
+    // prod even though it worked on a dev machine in IST. We extract the
+    // hour/minute via Intl.DateTimeFormat in Asia/Kolkata so the policy
+    // applies correctly regardless of the host timezone.
     const now = new Date();
+    const istParts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour:   '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+    const istHour   = parseInt(istParts.find(p => p.type === 'hour')?.value   || '0', 10);
+    const istMinute = parseInt(istParts.find(p => p.type === 'minute')?.value || '0', 10);
     const isLate =
-      now.getHours() > 10 || (now.getHours() === 10 && now.getMinutes() >= 1);
+      istHour > 10 || (istHour === 10 && istMinute >= 1);
     const status = isLate ? 'late' : 'present';
 
     const checkInLat = (typeof lat === 'number' && isFinite(lat)) ? lat : null;
@@ -259,7 +274,40 @@ exports.checkOut = async (req, res) => {
     record.checkOut = now;
     record.workedHours =
       Math.round(((record.checkOut - record.checkIn) / 3600000) * 100) / 100;
-    if (record.workedHours < 4) record.status = 'halfday';
+
+    // ─── Early-checkout policy ────────────────────────────────────────
+    // Standard workday is ~8 hrs. If the employee leaves with less than
+    // ~6.5 hrs on the clock, treat it as a partial day:
+    //   • If they filed a Permission for today → status stays whatever
+    //     the day was (present/late); LOP rule counts each permission
+    //     against the 2-per-month policy. Permission already documents
+    //     why they left early.
+    //   • If they did NOT file a Permission → mark the row as 'halfday'.
+    //     The LOP rule treats every halfday over the 2-per-month quota
+    //     as 0.5 LOP, so habitual early-leavers still hit the policy.
+    const SHORT_DAY_HOURS = 6.5;
+    if (record.workedHours < SHORT_DAY_HOURS) {
+      let hadPermission = false;
+      try {
+        const perm = await Leave.findOne({
+          user: req.user.id,
+          requestType: 'permission',
+          date,
+          status: { $in: ['approved', 'pending'] },
+        }).lean();
+        hadPermission = !!perm;
+      } catch { /* if the lookup fails, fall through and assume no permission */ }
+
+      if (!hadPermission) {
+        // No permission on file → half-day LOP fodder. The LOP calc on
+        // the read path (HRMS Reports + Productivity card) folds this
+        // into 1/2 LOP via the excessPerms branch.
+        record.status = 'halfday';
+      }
+      // If hadPermission, leave the status untouched — the day is
+      // accounted for via the permission row.
+    }
+
 
     const checkOutLat = (typeof lat === 'number' && isFinite(lat)) ? lat : null;
     const checkOutLng = (typeof lng === 'number' && isFinite(lng)) ? lng : null;
@@ -780,15 +828,21 @@ exports.adminListAll = async (req, res) => {
 
   try {
     const q = {};
+    // Date range we'll need for overlaying approved leaves.
+    let rangeStart, rangeEnd;
     if (req.query.date) {
       q.date = req.query.date;
+      rangeStart = rangeEnd = req.query.date;
     } else if (req.query.month && req.query.year) {
       const m = parseInt(req.query.month, 10);
       const y = parseInt(req.query.year, 10);
       const { start, end } = monthBounds(m, y);
       q.date = { $gte: start, $lte: end };
+      rangeStart = start; rangeEnd = end;
     } else {
-      q.date = todayISO();
+      const t = todayISO();
+      q.date = t;
+      rangeStart = rangeEnd = t;
     }
     const limit = Math.min(parseInt(req.query.limit, 10) || 2000, 5000);
     const items = await Attendance.find(q)
@@ -799,6 +853,102 @@ exports.adminListAll = async (req, res) => {
       .sort({ date: -1, checkIn: 1 })
       .limit(limit)
       .lean();
+
+    // ─── Late status derived from check-in time (IST) ──────────────────
+    // We don't trust the stored `status` blindly: rows saved before the
+    // IST-timezone fix landed (or by any client running on a UTC host)
+    // were marked 'present' even though the employee actually clocked in
+    // after 10:01 AM local. We re-derive the late flag from the check-in
+    // timestamp here so every consumer (HRMS Attendance Logs, Reports,
+    // Dashboard) sees the correct value without a DB migration.
+    const istHm = (d) => {
+      try {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+          timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(new Date(d));
+        return {
+          h: parseInt(parts.find(p => p.type === 'hour')?.value   || '0', 10),
+          m: parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10),
+        };
+      } catch { return { h: 0, m: 0 }; }
+    };
+    for (const a of items) {
+      if (!a.checkIn) continue;
+      // Only override the on-time / late distinction. Leave / permission /
+      // halfday / absent rows keep their own status — those are not about
+      // when the employee arrived.
+      const s = String(a.status || '').toLowerCase();
+      if (s !== 'present' && s !== 'late') continue;
+      const { h, m } = istHm(a.checkIn);
+      const isLate = h > 10 || (h === 10 && m >= 1);
+      a.status = isLate ? 'late' : 'present';
+    }
+
+    // ─── Overlay approved leaves + permissions onto the day(s) ────────
+    // An employee on approved Leave / Permission for a day still needs to
+    // appear on HRMS Attendance Logs even when they never tapped Check-In
+    // (which is the usual case for full leave days). We synthesize a
+    // pseudo-attendance row for each leave/permission covering the queried
+    // day(s) and merge it into the response if no real attendance row
+    // exists for that user + date.
+    try {
+      const seen = new Set(items.map(a => String(a.user?._id || a.user) + '|' + a.date));
+      const leaves = await Leave.find({
+        status: 'approved',
+        $or: [
+          // Leave whose [startDate, endDate] window overlaps the range.
+          { requestType: 'leave',      startDate: { $lte: rangeEnd }, endDate: { $gte: rangeStart } },
+          // Permission whose single `date` falls inside the range.
+          { requestType: 'permission', date: { $gte: rangeStart, $lte: rangeEnd } },
+        ],
+      })
+        .populate('user', 'firstName lastName name employeeId email designation department designationTitle departmentName')
+        .limit(limit)
+        .lean();
+
+      const overlay = [];
+      for (const lv of leaves) {
+        if (!lv.user) continue;
+        // Build the set of dates this leave covers inside the query range.
+        const dates = [];
+        if (lv.requestType === 'permission') {
+          if (lv.date && lv.date >= rangeStart && lv.date <= rangeEnd) dates.push(lv.date);
+        } else {
+          // Walk start..end day-by-day and add every covered date that
+          // also intersects the queried range.
+          const s = new Date(Math.max(new Date(lv.startDate || rangeStart), new Date(rangeStart)));
+          const e = new Date(Math.min(new Date(lv.endDate   || rangeStart), new Date(rangeEnd)));
+          for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+            dates.push(d.toISOString().slice(0, 10));
+          }
+        }
+        for (const date of dates) {
+          const key = String(lv.user._id) + '|' + date;
+          if (seen.has(key)) continue;        // real attendance row wins
+          seen.add(key);
+          overlay.push({
+            _id:    'lv-' + lv._id + '-' + date,
+            user:   lv.user,
+            date,
+            status: lv.requestType === 'permission' ? 'permission' : 'leave',
+            checkIn:  null,
+            checkOut: null,
+            // Permission carries the time-of-day window; full-day leave does not.
+            startTime: lv.startTime || null,
+            endTime:   lv.endTime   || null,
+            durationHours: lv.durationHours || null,
+            // Flag so the HRMS UI can distinguish overlayed rows if it wants.
+            isOverlay: true,
+            leaveType: lv.leaveType || lv.permissionType || '',
+            reason:    lv.reason    || '',
+          });
+        }
+      }
+      items.push(...overlay);
+    } catch (e) {
+      console.warn('[attendance.adminListAll] leave overlay failed:', e.message);
+    }
+
     res.json({ count: items.length, items });
   } catch (err) {
     console.error('attendance.adminListAll error:', err);

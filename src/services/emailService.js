@@ -75,16 +75,8 @@ async function sendViaSendGrid(toEmail, subject, html, text) {
     ],
   };
 
-  // Inline logo (CID) — the HTML references <img src="cid:logo.png">.
-  if (LOGO_BASE64) {
-    payload.attachments = [{
-      content:     LOGO_BASE64,
-      filename:    'logo.png',
-      type:        'image/png',
-      disposition: 'inline',
-      content_id:  LOGO_CID,
-    }];
-  }
+  // Logo attachment intentionally removed — plain text only.
+
 
   // Use global fetch (Node 18+) — no extra dependency needed.
   const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
@@ -122,7 +114,7 @@ function buildHtml(otp, fromName) {
   return `
   <div style="font-family: Arial, Helvetica, sans-serif; max-width:520px; margin:0 auto; padding:32px 24px; background:#f6f9f5; border-radius:12px;">
     <div style="text-align:center; padding-bottom:18px;">
-      ${logoImg}
+      
     </div>
 
     <div style="background:#ffffff; border-radius:10px; padding:28px 24px; box-shadow:0 4px 12px rgba(0,0,0,0.04);">

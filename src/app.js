@@ -7,7 +7,49 @@ const compression = require('compression');
 const { startKeepAlive } = require('./keepAlive');
 
 const app = express();
-app.use(cors());
+
+// ─── CORS — manual middleware (same as HRMS) ────────────────────────
+// Three frontends consume this backend:
+//   • ERM mobile app (no Origin header → always allowed)
+//   • ERM web app    (origin set via CORS_ORIGINS env var)
+//   • HRMS admin     (server-to-server, uses x-admin-secret instead)
+//
+// Manual instead of cors() package so we never run into Render-edge
+// quirks where the preflight slips past the package middleware. Sets
+// headers first thing on every request, short-circuits OPTIONS with
+// 204 before anything else can touch the response.
+//
+// Set CORS_ORIGINS on Render with the deployed web-app URL, e.g.:
+//   CORS_ORIGINS=https://erm-web.vercel.app,https://erm.tescocompany.in
+// Leave it unset locally so npm run dev allows everything.
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  if (allowedOrigins.length === 0) return true;
+  return allowedOrigins.includes(origin.replace(/\/+$/, ''));
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods',
+      'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers',
+      req.headers['access-control-request-headers'] ||
+        'Content-Type, Authorization, X-Admin-Email, X-Admin-Secret, X-Requested-With');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
 // gzip every JSON response > 1 KB. The daily-route polyline is the
 // biggest payload the HRMS asks for (a few KB after simplification)
 // and gzips down to roughly 30% of that. Saves ~200-500 ms on the

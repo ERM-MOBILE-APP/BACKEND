@@ -337,21 +337,52 @@ exports.adminUpdate = async (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
     const { id } = req.params;
-    const { status, hrComment, reviewedBy } = req.body || {};
+    const { status, hrComment, reviewedBy, approvedAmount, amountComment } = req.body || {};
     const allowance = await Allowance.findById(id);
     if (!allowance) return res.status(404).json({ message: 'Allowance not found' });
 
     if (status !== undefined)     allowance.status     = String(status).toLowerCase();
     if (hrComment !== undefined)  allowance.hrComment  = String(hrComment);
     if (reviewedBy !== undefined) allowance.reviewedBy = String(reviewedBy);
+
+    // Approval-amount breakdown. HR can approve LESS than what the
+    // employee requested — the rejected portion is auto-derived so the
+    // two numbers always sum to the original `amount`.
+    if (approvedAmount !== undefined) {
+      const approved = Math.max(0, Math.min(Number(approvedAmount) || 0, Number(allowance.amount) || 0));
+      allowance.approvedAmount = approved;
+      allowance.rejectedAmount = Math.max(0, (Number(allowance.amount) || 0) - approved);
+    }
+    if (amountComment !== undefined) allowance.amountComment = String(amountComment);
+    // Full reject → approvedAmount = 0, rejectedAmount = full amount.
+    if (String(status || '').toLowerCase() === 'rejected') {
+      allowance.approvedAmount = 0;
+      allowance.rejectedAmount = Number(allowance.amount) || 0;
+    }
     allowance.reviewedAt = new Date();
     await allowance.save();
 
     try {
       const verb = allowance.status === 'approved' ? 'approved' : allowance.status === 'rejected' ? 'rejected' : 'updated';
+      // Build a richer notification body that includes the approved /
+      // rejected breakdown so the employee sees exactly what HR signed
+      // off on, not just "approved".
+      let bodyLine;
+      if (allowance.status === 'approved') {
+        const approvedAmt = Number(allowance.approvedAmount) || Number(allowance.amount) || 0;
+        const rejectedAmt = Number(allowance.rejectedAmount) || 0;
+        bodyLine = rejectedAmt > 0
+          ? `Approved ${fmtRupees(approvedAmt)} of your ${fmtRupees(allowance.amount)} ${allowance.type} claim (${fmtRupees(rejectedAmt)} not approved).`
+          : `Approved ${fmtRupees(approvedAmt)} for your ${allowance.type} claim.`;
+      } else if (allowance.status === 'rejected') {
+        bodyLine = `Your ${allowance.type} claim of ${fmtRupees(allowance.amount)} was rejected.`;
+      } else {
+        bodyLine = `Your ${allowance.type} allowance has been ${verb}.`;
+      }
+      if (allowance.amountComment) bodyLine += ` Note: ${allowance.amountComment}`;
       await notify(allowance.user, {
         title: `Allowance ${verb}`,
-        body:  `Your ${allowance.type} allowance of ${fmtRupees(allowance.amount)} has been ${verb}.`,
+        body:  bodyLine,
         kind:  'allowance',
       });
     } catch (e) { console.warn('[allowance notify]', e.message); }
