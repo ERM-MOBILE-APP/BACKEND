@@ -28,6 +28,10 @@ const allowanceSchema = new mongoose.Schema(
     toLat:   { type: Number, default: null },
     toLng:   { type: Number, default: null },
     amount: { type: Number, required: true },
+    // What the employee originally typed before the GPS-petrol allowlist
+    // override (if any) replaced `amount` with distance x petrol rate.
+    // Surfaced to HR for audit so they can see claim vs. formula.
+    typedAmount: { type: Number, default: 0 },
     notes: { type: String, default: '' },
     receiptUrl: { type: String, default: '' },
     // Manager-tier status — set by the assigned manager via ERM Web's

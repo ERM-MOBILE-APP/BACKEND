@@ -1,0 +1,85 @@
+/**
+ * autoCloseAttendance — nightly sweeper that closes any attendance row
+ * the employee forgot to check out of.
+ *
+ *   • Runs once at boot, then on a 10-min interval — whenever the wall
+ *     clock has just crossed midnight IST it runs the close. We don't
+ *     trust a single setTimeout(midnight) because Render restarts the
+ *     process throughout the day and we'd miss the cutoff.
+ *   • For every Attendance doc with checkIn but no checkOut on the day
+ *     BEFORE today's IST date, we stamp checkOut = end-of-that-day and
+ *     flip status to 'absent' — HR's rule is that an employee who
+ *     forgot to clock out gets the day struck off rather than counted.
+ *
+ * Idempotent: the same doc on the next pass already has checkOut set,
+ * so the filter excludes it.
+ */
+const Attendance = require('./models/Attendance');
+
+const IST_OFFSET_MIN = 5 * 60 + 30;   // +05:30
+
+// Returns the IST yyyy-mm-dd for any JS Date.
+function istDateStr(d) {
+  const t = new Date(d.getTime() + IST_OFFSET_MIN * 60 * 1000);
+  return t.toISOString().slice(0, 10);
+}
+
+// Last IST midnight — every doc whose `date` is BEFORE this string with an
+// open check-in is a candidate for auto-close.
+function lastIstMidnight() {
+  const now = new Date();
+  const ist = new Date(now.getTime() + IST_OFFSET_MIN * 60 * 1000);
+  // Construct end-of-yesterday IST at 23:59:59.999 — used as the checkOut stamp.
+  ist.setUTCHours(0, 0, 0, 0);                  // start of today IST in UTC terms
+  ist.setUTCMinutes(ist.getUTCMinutes() - 1);   // back one minute → yesterday 23:59 IST
+  return ist;
+}
+
+async function sweepOnce() {
+  try {
+    const todayIst = istDateStr(new Date());
+    // Anything with checkIn set, no checkOut, and date strictly before today.
+    const candidates = await Attendance.find({
+      checkIn:  { $ne: null },
+      $or: [{ checkOut: null }, { checkOut: { $exists: false } }],
+      date:     { $lt: todayIst },
+    }).limit(500);
+
+    if (!candidates.length) return { closed: 0 };
+
+    const closeStamp = lastIstMidnight();
+    let closed = 0;
+    for (const row of candidates) {
+      // Belt-and-braces: skip if somehow checkOut got set between the
+      // find and the save (concurrent mobile submit).
+      if (row.checkOut) continue;
+      row.checkOut = closeStamp;
+      row.status   = 'absent';
+      row.autoClosed = true;
+      row.autoClosedAt = new Date();
+      try { await row.save(); closed++; }
+      catch (e) { console.warn('[autoCloseAttendance] save failed:', e.message); }
+    }
+    if (closed) console.log(`[autoCloseAttendance] closed ${closed} forgotten check-in(s)`);
+    return { closed };
+  } catch (err) {
+    console.warn('[autoCloseAttendance] sweep failed:', err.message);
+    return { closed: 0, error: err.message };
+  }
+}
+
+// Boot the sweeper. Hits once at startup, then every 10 minutes — that's
+// frequent enough to catch the midnight rollover within a 10-min window
+// and infrequent enough to not stress Mongo.
+function startAutoCloseAttendance() {
+  // Skip in test/no-DB environments.
+  if (!process.env.MONGO_URI && process.env.NODE_ENV !== 'production') {
+    return;
+  }
+  console.log('[autoCloseAttendance] scheduled — runs every 10 min');
+  // Run once 15s after boot so we don't compete with seed/migrations.
+  setTimeout(sweepOnce, 15_000);
+  setInterval(sweepOnce, 10 * 60 * 1000);
+}
+
+module.exports = { startAutoCloseAttendance, sweepOnce };

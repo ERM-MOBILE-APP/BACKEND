@@ -26,9 +26,20 @@ const { notify }   = require('../utils/notify');
  * pings (employee wasn't checked in, GPS was off, etc.). The caller
  * decides whether to fall back to a user-typed value in that case.
  */
-async function computeDailyDistanceKm(userId, dateIso) {
+async function computeDailyDistanceKm(userId, dateIso, opts) {
   if (!userId || !dateIso) return { distanceKm: 0, from: null, to: null };
-  const pings = await LocationPing.find({ user: userId, date: dateIso })
+  const from = opts && opts.from ? new Date(opts.from) : null;
+  const to   = opts && opts.to   ? new Date(opts.to)   : null;
+  const query = { user: userId, date: dateIso };
+  // When check-in / check-out bounds are supplied, restrict the polyline
+  // to that window — the HR rule for the GPS-petrol allowlist is to only
+  // count distance driven during the worked portion of the day.
+  if (from || to) {
+    query.recordedAt = {};
+    if (from) query.recordedAt.$gte = from;
+    if (to)   query.recordedAt.$lte = to;
+  }
+  const pings = await LocationPing.find(query)
     .sort({ recordedAt: 1 })
     .select('lat lng recordedAt')
     .lean();
@@ -119,15 +130,54 @@ exports.submitAllowance = async (req, res) => {
     let distanceSource   = 'manual';
     let fromLat = null, fromLng = null, toLat = null, toLng = null;
     if (type === 'travel' || type === 'petrol') {
-      const gps = await computeDailyDistanceKm(req.user.id, date);
+      // For the GPS-petrol allowlist (field sales + execution teams),
+      // restrict the polyline window to the day's check-in → check-out
+      // so distance reflects ONLY the worked hours. For everyone else
+      // we keep the existing whole-day behaviour.
+      let windowOpts = null;
+      let onAllowlist = false;
+      let petrolRate  = 0;
+      try {
+        const User = require('../models/User');
+        const Attendance = require('../models/Attendance');
+        const { isPetrolGpsEmployee, PETROL_RATE_RUPEES_PER_KM } = require('../petrolGpsAllowlist');
+        const me = await User.findById(req.user.id)
+          .select('firstName lastName name department departmentName')
+          .lean();
+        if (type === 'petrol' && isPetrolGpsEmployee(me)) {
+          onAllowlist = true;
+          petrolRate  = PETROL_RATE_RUPEES_PER_KM;
+          const att = await Attendance.findOne({ user: req.user.id, date })
+            .select('checkIn checkOut').lean();
+          if (att && att.checkIn) {
+            windowOpts = { from: att.checkIn, to: att.checkOut || new Date() };
+          }
+        }
+      } catch (e) { console.warn('[submitAllowance] allowlist lookup failed:', e.message); }
+
+      const gps = await computeDailyDistanceKm(req.user.id, date, windowOpts);
       if (gps.distanceKm > 0 && gps.from && gps.to) {
         resolvedDistance = gps.distanceKm;
-        distanceSource   = 'gps';
+        distanceSource   = windowOpts ? 'gps-checkin-window' : 'gps';
         fromLat = gps.from.lat; fromLng = gps.from.lng;
         toLat   = gps.to.lat;   toLng   = gps.to.lng;
       }
+      // Allowlist override — petrol amount is rate-derived, not employee-typed.
+      // (gps.distanceKm > 0 not required: even a zero-km day costs ₹0, not the
+      // typed amount, so HR reimburses based on what the GPS shows.)
+      if (onAllowlist && petrolRate > 0) {
+        const computedAmt = Math.round(resolvedDistance * petrolRate * 100) / 100;
+        // Stash the original so HR audit can see what the employee typed.
+        req.body._typedAmount = Number(amount);
+        // Override req-level amount that flows into Allowance.create below.
+        req.body.amount = computedAmt;
+      }
     }
 
+    // The allowlist branch above may have overridden req.body.amount with
+    // (distance × petrol rate). Pick that up so the stored amount matches
+    // the formula HR enforces.
+    const finalAmount = Number(req.body.amount ?? amount) || 0;
     const allowance = await Allowance.create({
       user: req.user.id,
       type,
@@ -142,7 +192,10 @@ exports.submitAllowance = async (req, res) => {
       // even if the LocationPing rows get archived later, the allowance
       // row remembers where the employee was.
       fromLat, fromLng, toLat, toLng,
-      amount: Number(amount),
+      amount: finalAmount,
+      // Preserve the employee's typed amount alongside, so HR audit can
+      // compare claim vs. formula in the row history.
+      typedAmount: Number(amount) || 0,
       notes: notes || '',
       receiptUrl: receiptUrl || '',
     });
