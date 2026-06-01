@@ -40,6 +40,16 @@ const attendanceSchema = new mongoose.Schema(
     //   'none'   — no usable coords on the day
     totalDistanceKm: { type: Number, default: 0 },
     distanceSource:  { type: String, enum: ['gps', 'pins', 'none'], default: 'none' },
+
+    // ── HR LOP markers ───────────────────────────────────────────────
+    // True when the employee hit Check-Out before the scheduled end of
+    // day AND no approved permission covers that day. The leavePolicy
+    // module tallies these and converts each occurrence into 0.5 LOP.
+    earlyCheckoutLop: { type: Boolean, default: false },
+    // True when the nightly sweeper closed an open check-in at IST midnight
+    // (separate from `autoCheckedOut` which is GPS-driven close).
+    autoClosed:       { type: Boolean, default: false },
+    autoClosedAt:     { type: Date,    default: null },
   },
   { timestamps: true }
 );

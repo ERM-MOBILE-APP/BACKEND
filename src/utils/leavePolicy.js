@@ -29,17 +29,27 @@
 const Leave      = require('../models/Leave');
 const Attendance = require('../models/Attendance');
 
-const MONTHLY_LEAVE_ALLOWED      = 1; // free unpaid-leave days per month
+const MONTHLY_LEAVE_ALLOWED      = 1; // free paid CL days per month
 const MONTHLY_PERMISSION_ALLOWED = 2; // free permission slots per month
 const MAX_PERMISSION_HOURS       = 2; // each permission allowed up to this many hours
 const HOURS_PER_LOP_DAY          = 8; // 8 hours of excess permission time = 1 LOP day
 
-// Late-to-LOP conversion. Cumulative within the month:
+// Late-to-LOP conversion. Cumulative within the month — loops every 3 lates:
 //   • 3 lates  = 0.5 LOP day
 //   • 6 lates  = 1.0 LOP day
-//   • 9 lates  = 1.5 LOP day  (rule scales linearly past 6)
+//   • 9 lates  = 1.5 LOP day  (scales linearly past 6)
 // Anyone with fewer than 3 late check-ins in the month gets no LOP from lateness.
 const LATES_PER_HALF_DAY_LOP     = 3;
+
+// Beyond ordinary lateness (10:01-10:30) HR set a harder rule: a check-in
+// past 10:30 is immediately 0.5 LOP for that day, regardless of how many
+// other lates the employee has accumulated.
+const HARD_LATE_HOUR_IST   = 10;
+const HARD_LATE_MINUTE_IST = 30;
+
+// Per-day attendance-derived LOP rules — folded into the totals below.
+// Each early-checkout without an approved permission counts as 0.5 LOP.
+const EARLY_CHECKOUT_LOP_PER_DAY = 0.5;
 
 function parseDateString(s) {
   if (!s) return null;
@@ -107,13 +117,41 @@ async function computeLeavePolicy(userId, year, month0) {
   const start = `${year}-${mm}-01`;
   const end   = `${year}-${mm}-${String(new Date(year, month0 + 1, 0).getDate()).padStart(2, '0')}`;
   let lateCount = 0;
+  let hardLateCount = 0;        // check-ins past 10:30 IST
+  let earlyCheckoutCount = 0;   // checked out before scheduled end without approved permission
   try {
     lateCount = await Attendance.countDocuments({
       user:   userId,
       status: 'late',
       date:   { $gte: start, $lte: end },
     });
-  } catch { /* collection not ready — non-fatal, lateCount stays 0 */ }
+
+    // Inspect the month's rows to count hard-lates and unapproved early
+    // checkouts. We pull the minimum fields needed so the query stays
+    // cheap even on months with 30 rows × hundreds of employees.
+    const rows = await Attendance.find({
+      user: userId,
+      date: { $gte: start, $lte: end },
+    }).select('date checkIn checkOut earlyCheckoutLop status').lean();
+
+    for (const r of rows) {
+      // ── Hard late (>= 10:30 IST) → 0.5 LOP, separate from the 3-late rule.
+      if (r.checkIn) {
+        // Stamp the check-in in IST (UTC+5:30) and compare hours+minutes.
+        const ist = new Date(new Date(r.checkIn).getTime() + (5 * 60 + 30) * 60 * 1000);
+        const h = ist.getUTCHours();
+        const m = ist.getUTCMinutes();
+        if (h > HARD_LATE_HOUR_IST || (h === HARD_LATE_HOUR_IST && m > HARD_LATE_MINUTE_IST)) {
+          hardLateCount += 1;
+        }
+      }
+      // ── Early checkout flagged by the mobile/check-out endpoint.
+      // The endpoint stamps `earlyCheckoutLop: true` when the employee
+      // hit Check-Out before scheduled end AND there's no APPROVED
+      // permission for that day. We just tally those rows here.
+      if (r.earlyCheckoutLop) earlyCheckoutCount += 1;
+    }
+  } catch { /* collection not ready — non-fatal, counts stay 0 */ }
 
   // LOP buckets
   const lopFromExtraLeaveDays       = Math.max(0, leaveUsedDays   - MONTHLY_LEAVE_ALLOWED);
@@ -126,9 +164,15 @@ async function computeLeavePolicy(userId, year, month0) {
   // floor() means the LOP only kicks in once the threshold is crossed —
   // 1 and 2 lates are still free.
   const lopFromLateCheckIns = Math.floor(lateCount / LATES_PER_HALF_DAY_LOP) * 0.5;
+  // Hard-late = each check-in past 10:30 IST contributes 0.5 LOP directly.
+  // This is independent of the 3-lates rule — a single 10:31 entry is
+  // already half a day.
+  const lopFromHardLates    = hardLateCount * 0.5;
+  const lopFromEarlyCheckout = earlyCheckoutCount * EARLY_CHECKOUT_LOP_PER_DAY;
   const totalLopDays =
     lopFromExtraLeaveDays + lopFromExtraPermissions +
-    lopFromPermissionExcessHours + lopFromLateCheckIns;
+    lopFromPermissionExcessHours + lopFromLateCheckIns +
+    lopFromHardLates + lopFromEarlyCheckout;
 
   const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -148,6 +192,8 @@ async function computeLeavePolicy(userId, year, month0) {
       permissionHoursUsed:   round2(permissionHoursUsed),
       permissionExcessHours: round2(permissionExcessHours),
       lateCheckIns:          lateCount,
+      hardLateCheckIns:      hardLateCount,
+      earlyCheckouts:        earlyCheckoutCount,
     },
     balance: {
       leaveRemainingDays:    round2(Math.max(0, MONTHLY_LEAVE_ALLOWED - leaveUsedDays)),
@@ -158,6 +204,8 @@ async function computeLeavePolicy(userId, year, month0) {
       fromExtraPermissions:      round2(lopFromExtraPermissions),
       fromPermissionExcessHours: round2(lopFromPermissionExcessHours),
       fromLateCheckIns:          round2(lopFromLateCheckIns),
+      fromHardLates:             round2(lopFromHardLates),
+      fromEarlyCheckouts:        round2(lopFromEarlyCheckout),
       totalDays:                 round2(totalLopDays),
     },
   };

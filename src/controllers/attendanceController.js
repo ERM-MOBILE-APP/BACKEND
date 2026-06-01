@@ -299,11 +299,16 @@ exports.checkOut = async (req, res) => {
       } catch { /* if the lookup fails, fall through and assume no permission */ }
 
       if (!hadPermission) {
-        // No permission on file → half-day LOP fodder. The LOP calc on
-        // the read path (HRMS Reports + Productivity card) folds this
-        // into 1/2 LOP via the excessPerms branch.
+        // No permission on file → half-day LOP. We also stamp an
+        // explicit `earlyCheckoutLop` flag so the leavePolicy module
+        // can count it cleanly without depending on the status enum.
         record.status = 'halfday';
+        record.earlyCheckoutLop = true;
       }
+      // If the employee DID have an approved-or-pending permission, the
+      // early checkout is excused — clear any lingering flag from a
+      // prior bad close.
+      if (hadPermission) record.earlyCheckoutLop = false;
       // If hadPermission, leave the status untouched — the day is
       // accounted for via the permission row.
     }
