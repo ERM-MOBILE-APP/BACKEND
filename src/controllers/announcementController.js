@@ -37,13 +37,30 @@ function normalizeAudience(a) {
 }
 
 // GET /api/announcement
-// Returns the latest active announcements (most recent first)
+// Returns the latest active announcements (most recent first).
+//
+// Why .lean() — we share the `announcements` collection with HRMS,
+// which writes attachments {name, mimeType, size, dataBase64, url, type}
+// onto each doc. Hydrating into Mongoose docs can silently drop fields
+// the local schema isn't perfectly aligned with (e.g. when an older
+// deployment hasn't picked up a schema change yet). `.lean()` skips
+// hydration and returns the raw DB document, so every field that exists
+// in MongoDB — including `attachments`, `description`, `priority`, etc.
+// — is surfaced to the ERM Web + ERM Mobile clients untouched.
 exports.list = async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
     const items = await Announcement.find({ isActive: true })
       .sort({ createdAt: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
+    // One-line counter so prod logs make it obvious whether attachments
+    // are flowing through. If you see "att=0" for every row but HR knows
+    // they uploaded files, the issue is upstream (HRMS POST).
+    try {
+      const attCount = items.reduce((s, r) => s + (Array.isArray(r?.attachments) ? r.attachments.length : 0), 0);
+      console.log(`[announcement.list] returning ${items.length} rows, total attachments=${attCount}`);
+    } catch { /* logging is best-effort */ }
     res.json(items);
   } catch (err) {
     console.error('announcement.list error:', err);
@@ -54,7 +71,10 @@ exports.list = async (req, res) => {
 // GET /api/announcement/:id
 exports.getById = async (req, res) => {
   try {
-    const a = await Announcement.findById(req.params.id);
+    // Same .lean() rationale as list above — return the raw Mongo doc
+    // so attachments / description / any extra HRMS field round-trip
+    // intact regardless of local schema drift.
+    const a = await Announcement.findById(req.params.id).lean();
     if (!a) return res.status(404).json({ message: 'Not found' });
     res.json(a);
   } catch (err) {
