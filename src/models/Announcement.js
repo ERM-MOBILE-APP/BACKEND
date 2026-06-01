@@ -20,8 +20,30 @@ const announcementSchema = new mongoose.Schema(
     // the HRMS document _id so subsequent updates / deletes from HRMS can
     // find and refresh the right mobile row instead of duplicating.
     externalId: { type: String, default: null, index: true, sparse: true },
+
+    // ── Attachments ───────────────────────────────────────────────────
+    // Mirrors the HRMS schema. Files are stored inline as base64 in
+    // `dataBase64` so the mobile / ERM Web apps can render images
+    // straight from the API response without a separate object store.
+    // Each item: { name, mimeType, size, dataBase64, url, type }.
+    // Without this field declared, Mongoose strict mode would silently
+    // strip the array off the response — which is exactly why HRMS
+    // uploads weren't reaching the ERM apps before today.
+    attachments: {
+      type: [
+        {
+          name:       { type: String, default: '' },
+          mimeType:   { type: String, default: '' },
+          size:       { type: Number, default: 0 },
+          dataBase64: { type: String, default: '' },
+          url:        { type: String, default: '' },
+          type:       { type: String, default: '' },
+        },
+      ],
+      default: [],
+    },
   },
-  { timestamps: true }
+  { timestamps: true, strict: false }
 );
 
 announcementSchema.index({ createdAt: -1 });

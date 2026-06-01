@@ -127,10 +127,26 @@ exports.remove = async (req, res) => {
 exports.adminCreate = async (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
-    const { title, body, category, postedBy, audience, externalId } = req.body || {};
+    const { title, body, category, postedBy, audience, externalId, attachments } = req.body || {};
     if (!title || !body) {
       return res.status(400).json({ message: 'title and body are required' });
     }
+    // Whatever shape HR sent for attachments, normalise to the array
+    // the schema expects (allowing both single object + array, and
+    // stripping any unknown keys before save).
+    const cleanAttachments = Array.isArray(attachments)
+      ? attachments
+          .filter((a) => a && (a.dataBase64 || a.url))
+          .map((a) => ({
+            name:       String(a.name       || ''),
+            mimeType:   String(a.mimeType   || a.type || ''),
+            size:       Number(a.size       || 0),
+            dataBase64: String(a.dataBase64 || ''),
+            url:        String(a.url        || ''),
+            type:       String(a.type       || ''),
+          }))
+      : [];
+
     // If externalId already exists, treat as upsert — refresh that row
     // instead of creating a duplicate.
     if (externalId) {
@@ -142,6 +158,9 @@ exports.adminCreate = async (req, res) => {
         existing.postedBy = postedBy ? String(postedBy).trim() : 'HR';
         existing.audience = normalizeAudience(audience);
         existing.isActive = true;
+        // Replace the attachments wholesale so a HRMS re-edit that
+        // removed a file actually clears it on the mobile side.
+        existing.attachments = cleanAttachments;
         await existing.save();
         return res.status(200).json({ message: 'Synced (existing)', announcement: existing });
       }
@@ -153,6 +172,7 @@ exports.adminCreate = async (req, res) => {
       postedBy: postedBy ? String(postedBy).trim() : 'HR',
       audience: normalizeAudience(audience),
       externalId: externalId || undefined,
+      attachments: cleanAttachments,
     });
     res.status(201).json({ message: 'Created', announcement: a });
   } catch (err) {
