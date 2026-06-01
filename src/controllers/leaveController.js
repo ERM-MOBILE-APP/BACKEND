@@ -289,14 +289,28 @@ exports.adminListAll = async (req, res) => {
 exports.adminUpdate = async (req, res) => {
   if (!checkAdmin(req, res)) return;
   try {
-    const { status, hrComment, reviewedBy } = req.body || {};
-    if (!['approved', 'rejected', 'pending'].includes(status)) {
+    const { status, hrComment, reviewedBy, managerStatus } = req.body || {};
+    // Either a status flip OR a managerStatus flip is enough — the HRMS
+    // Manager Approve button sends only `managerStatus` and used to be
+    // rejected by the old status-only validator. We also keep the legacy
+    // shape working (status without managerStatus).
+    const wantsStatus        = status !== undefined && status !== null && status !== '';
+    const wantsManagerStatus = managerStatus !== undefined && managerStatus !== null && managerStatus !== '';
+    if (!wantsStatus && !wantsManagerStatus) {
+      return res.status(400).json({ message: 'status or managerStatus required' });
+    }
+    if (wantsStatus && !['approved', 'rejected', 'pending'].includes(status)) {
       return res.status(400).json({ message: 'status must be approved, rejected, or pending' });
+    }
+    if (wantsManagerStatus && !['approved', 'rejected', 'pending', ''].includes(String(managerStatus).toLowerCase())) {
+      return res.status(400).json({ message: 'managerStatus must be approved, rejected, or pending' });
     }
     const prev = await Leave.findById(req.params.id);
     if (!prev) return res.status(404).json({ message: 'Leave not found' });
 
-    const update = { status, reviewedAt: new Date() };
+    const update = { reviewedAt: new Date() };
+    if (wantsStatus)         update.status        = status;
+    if (wantsManagerStatus)  update.managerStatus = String(managerStatus).toLowerCase();
     if (typeof hrComment  === 'string') update.hrComment  = hrComment;
     if (typeof reviewedBy === 'string') update.reviewedBy = reviewedBy;
 
