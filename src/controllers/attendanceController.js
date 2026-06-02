@@ -1270,6 +1270,83 @@ exports.adminLiveLocations = async (req, res) => {
  *   • Daily route view — pick any employee + date, see polyline + km,
  *     regardless of whether they raised an allowance request.
  */
+/**
+ * GET /api/attendance/admin/daily-routes?date=YYYY-MM-DD
+ *
+ * Lightweight "every employee's km for the picked day" table. No
+ * polyline — just one row per employee with name, employee id, check
+ * in / out, total km (GPS-derived) and an allowance flag. HRMS "Daily
+ * Routes" page calls this to populate the listing; users then click a
+ * row to drill into the full polyline via adminDailyRoute.
+ *
+ * Was previously dropped by an unrelated file-tail rewrite, which is
+ * why `routes/attendance.js` was crashing with "handler must be a
+ * function" at boot — `adminDailyRoutesList` was undefined on import.
+ */
+exports.adminDailyRoutesList = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  try {
+    const date = String(req.query.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ message: 'date=YYYY-MM-DD required' });
+    }
+    // Every attendance record on this date — that's our "did this
+    // employee work today" set. We populate the user for the name +
+    // employeeId sidecar.
+    const att = await Attendance.find({ date })
+      .populate('user', 'firstName lastName name employeeId email designation department designationTitle departmentName')
+      .lean();
+    // Pre-load every allowance for the date so we can mark which
+    // employee filed one (allows HRMS to highlight rows whose km
+    // should be cross-checked against the claim).
+    const Allowance = require('../models/Allowance');
+    const allowances = await Allowance.find({ date }).lean();
+    const allowByUser = new Map(allowances.map((a) => [String(a.user), a]));
+
+    const items = [];
+    for (const a of att) {
+      const route = await buildDailyRoute(a.user?._id || a.user, date, {
+        checkIn:    a.checkIn,
+        checkOut:   a.checkOut,
+        checkInLat: a.checkInLat,
+        checkInLng: a.checkInLng,
+        checkOutLat: a.checkOutLat,
+        checkOutLng: a.checkOutLng,
+      });
+      const u = a.user || {};
+      const fullName =
+        u.name ||
+        ((u.firstName || '') + ' ' + (u.lastName || '')).trim() ||
+        '—';
+      const allow = allowByUser.get(String(u._id || a.user));
+      items.push({
+        _id:         String(u._id || a.user),
+        employeeId:  u.employeeId || '',
+        name:        fullName,
+        email:       u.email || '',
+        designation: u.designationTitle || u.designation || '',
+        department:  u.departmentName  || u.department  || '',
+        date,
+        checkIn:     a.checkIn  || null,
+        checkOut:    a.checkOut || null,
+        status:      a.status   || '',
+        distanceKm:  route.distanceKm,
+        source:      route.source,
+        hasAllowance: !!allow,
+        allowanceStatus: allow ? allow.status : '',
+      });
+    }
+    res.json({ count: items.length, items });
+  } catch (err) {
+    console.error('[attendance.adminDailyRoutesList]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
 exports.adminDailyRoute = async (req, res) => {
   const expected = (process.env.ADMIN_SECRET || '').trim();
   const got      = (req.headers['x-admin-secret'] || '').trim();
@@ -1283,52 +1360,41 @@ exports.adminDailyRoute = async (req, res) => {
     }
 
     // Resolve user. Prefer employeeId (TES047) for HR ergonomics; fall back
-    // to raw userId. Both look up against the shared `employees` collection
-    // (mobile User model points to the same collection as HRMS Employee).
-    let user = null;
+    // to raw userId. Both look up against the same User collection.
     const empIdRaw = String(req.query.employeeId || '').trim().toUpperCase();
-    const userIdRaw = String(req.query.userId || '').trim();
+    const userId   = String(req.query.userId    || '').trim();
+    let user;
     if (empIdRaw) {
-      user = await User.findOne({
-        $or: [{ employeeId: empIdRaw }, { userId: empIdRaw }],
-      }).select('_id firstName lastName name email employeeId userId').lean();
-    } else if (isObjId(userIdRaw)) {
-      user = await User.findById(userIdRaw)
-        .select('_id firstName lastName name email employeeId userId').lean();
+      user = await User.findOne({ employeeId: empIdRaw })
+        .select('firstName lastName name employeeId email designation department designationTitle departmentName')
+        .lean();
+    } else if (userId) {
+      user = await User.findById(userId)
+        .select('firstName lastName name employeeId email designation department designationTitle departmentName')
+        .lean();
     }
     if (!user) {
-      return res.status(404).json({ message: 'Employee not found' });
+      return res.status(404).json({ message: 'Employee not found.' });
     }
 
+    // Anchor the route window to the day's check-in / check-out span so
+    // pings before/after the shift don't inflate distance.
     const att = await Attendance.findOne({ user: user._id, date }).lean();
-    const trim = String(req.query.trim ?? '1') !== '0';
-
     const route = await buildDailyRoute(user._id, date, {
-      checkIn:     trim && att?.checkIn  ? att.checkIn  : undefined,
-      checkOut:    trim && att?.checkOut ? att.checkOut : undefined,
-      checkInLat:  att?.checkInLat,
-      checkInLng:  att?.checkInLng,
+      checkIn:    att?.checkIn,
+      checkOut:   att?.checkOut,
+      checkInLat: att?.checkInLat,
+      checkInLng: att?.checkInLng,
       checkOutLat: att?.checkOutLat,
       checkOutLng: att?.checkOutLng,
     });
 
-    // If we have a stamped value on the Attendance row AND the live
-    // compute came back empty (pings since pruned), trust the stamp.
-    let totalDistanceKm = route.distanceKm;
-    let distanceSource  = route.source;
-    if (totalDistanceKm === 0 && att && typeof att.totalDistanceKm === 'number' && att.totalDistanceKm > 0) {
-      totalDistanceKm = att.totalDistanceKm;
-      distanceSource  = att.distanceSource || 'gps';
-    }
-
-    // Surface any allowance the employee filed for this date so the HRMS
-    // can overlay the employee-marked from/to pins on top of the live
-    // route polyline.
+    // Allowance overlay — if this employee filed a travel/petrol claim
+    // on the date, surface the from/to pins so the map can render F + T
+    // markers alongside the GPS polyline.
     const Allowance = require('../models/Allowance');
     const allow = await Allowance.findOne({ user: user._id, date }).lean();
-    const allowance = allow ? {
-      _id:          allow._id,
-      type:         allow.type,
+    const allowanceShape = allow ? {
       fromLocation: allow.fromLocation,
       toLocation:   allow.toLocation,
       fromLat:      allow.fromLat,
@@ -1362,8 +1428,14 @@ exports.adminDailyRoute = async (req, res) => {
         status:    att.status,
         workHours: att.workHours,
       } : null,
-      route:    poly,
-      allowance: allowanceShape,
+      // Caller can read `polyline` (canonical) or `route` (legacy alias).
+      polyline:        route.polyline,
+      route:           route.polyline,
+      totalDistanceKm: route.distanceKm,
+      distanceSource:  route.source,
+      from:            route.from,
+      to:              route.to,
+      allowance:       allowanceShape,
     });
   } catch (err) {
     console.error('[attendance.adminDailyRoute]', err);
