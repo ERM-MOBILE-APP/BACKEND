@@ -75,9 +75,6 @@ async function sendViaSendGrid(toEmail, subject, html, text) {
     ],
   };
 
-  // Logo attachment intentionally removed — plain text only.
-
-
   // Use global fetch (Node 18+) — no extra dependency needed.
   const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
     method: 'POST',
@@ -93,15 +90,63 @@ async function sendViaSendGrid(toEmail, subject, html, text) {
     let errMsg = `HTTP ${res.status}`;
     try {
       const j = await res.json();
-      // SendGrid error format: { errors: [{ message, field, help }] }
       if (j.errors && j.errors.length)
         errMsg = j.errors.map((e) => e.message).join('; ');
       else errMsg = JSON.stringify(j);
     } catch (_) {}
-    throw new Error(`SendGrid: ${errMsg}`);
+    // Surface the HTTP status alongside the SendGrid error message so
+    // ops can quickly tell whether the key is dead (401), the sender
+    // is unverified (403), or the request itself is bad (400).
+    const err = new Error(`SendGrid (HTTP ${res.status}): ${errMsg}`);
+    err.status = res.status;
+    throw err;
   }
 
   return { messageId: res.headers.get('x-message-id') || 'queued' };
+}
+
+// ─── Brevo / Sendinblue fallback (HTTPS — also Render-free-tier safe) ──────
+// Brevo gives 300 free emails/day. Set BREVO_API_KEY + BREVO_FROM on Render
+// to enable. When SendGrid returns a 4xx (dead key, unverified sender, etc.)
+// we automatically retry the same OTP through Brevo so users aren't blocked
+// while ops rotates the SendGrid credentials.
+function hasBrevo() {
+  return !!(process.env.BREVO_API_KEY && process.env.BREVO_FROM);
+}
+
+async function sendViaBrevo(toEmail, subject, html, text) {
+  const apiKey    = process.env.BREVO_API_KEY;
+  const fromEmail = (process.env.BREVO_FROM      || '').trim();
+  const fromName  = (process.env.BREVO_FROM_NAME || 'Tesco ERM').trim();
+  const payload = {
+    sender:      { email: fromEmail, name: fromName },
+    to:          [{ email: toEmail }],
+    subject,
+    htmlContent: html,
+    textContent: text,
+  };
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept':       'application/json',
+      'api-key':      apiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    let errMsg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      errMsg = j?.message || JSON.stringify(j);
+    } catch (_) {}
+    const err = new Error(`Brevo (HTTP ${res.status}): ${errMsg}`);
+    err.status = res.status;
+    throw err;
+  }
+  let body = {};
+  try { body = await res.json(); } catch (_) {}
+  return { messageId: body?.messageId || 'queued' };
 }
 
 // ─── HTML template ───────────────────────────────────────────────────────────
@@ -146,12 +191,23 @@ function buildHtml(otp, fromName) {
 }
 
 // ─── Main send function ───────────────────────────────────────────────────────
+//
+// Order of attempt:
+//   1. SendGrid  (preferred — 100/day free)
+//   2. Brevo     (fallback when SendGrid returns a 4xx auth/sender error)
+//   3. Console-mock (dev — OTP printed to logs, response still flags
+//                    sent=false so the client surfaces an alert)
+//
+// We auto-fallback only on 4xx because a 5xx from SendGrid is a transient
+// outage and retrying through a different provider would risk
+// double-delivery once SendGrid recovers.
 async function sendOtpEmail(toEmail, otp) {
-  const fromName = (process.env.SENDGRID_FROM_NAME || 'Tesco ERM').trim();
+  const fromName = (process.env.SENDGRID_FROM_NAME || process.env.BREVO_FROM_NAME || 'Tesco ERM').trim();
   const html     = buildHtml(otp, fromName);
   const subject  = `Your Tesco ERM password reset code: ${otp}`;
   const text     = `Your Tesco ERM OTP is ${otp}. Valid for 10 minutes. Do not share this code.`;
 
+  let sgError = null;
   if (hasSendGrid()) {
     try {
       provider = 'sendgrid';
@@ -159,19 +215,45 @@ async function sendOtpEmail(toEmail, otp) {
       console.log(`[emailService] ✓ SendGrid → ${toEmail} (messageId: ${data?.messageId})`);
       return { sent: true, info: data, provider: 'sendgrid' };
     } catch (err) {
+      sgError = err;
       console.error('[emailService] SendGrid FAILED:', err.message);
-      return { sent: false, error: err.message, provider: 'sendgrid' };
+      // Only fall through to Brevo on auth / sender issues (4xx). A 5xx
+      // is a transient outage — we shouldn't retry through a different
+      // provider and risk a double-send when SendGrid recovers.
+      if (!(err.status >= 400 && err.status < 500)) {
+        return { sent: false, error: err.message, provider: 'sendgrid' };
+      }
     }
   }
 
-  // No provider configured — log the OTP so dev can still test the flow.
+  if (hasBrevo()) {
+    try {
+      provider = 'brevo';
+      const data = await sendViaBrevo(toEmail, subject, html, text);
+      console.log(`[emailService] ✓ Brevo (fallback) → ${toEmail} (messageId: ${data?.messageId})`);
+      return { sent: true, info: data, provider: 'brevo' };
+    } catch (err) {
+      console.error('[emailService] Brevo FAILED:', err.message);
+      const combined = sgError
+        ? `Both providers failed — SendGrid: ${sgError.message} | Brevo: ${err.message}`
+        : `Brevo: ${err.message}`;
+      return { sent: false, error: combined, provider: 'brevo' };
+    }
+  }
+
+  // No provider succeeded. Log the OTP so dev can still test, and bubble
+  // a useful error message back to the controller (which converts it
+  // into the alert the user sees).
   console.error(
-    `[emailService] SendGrid not configured — OTP for ${toEmail} = ${otp}` +
-    '\n  → Set SENDGRID_API_KEY + SENDGRID_FROM on Render (signup.sendgrid.com)'
+    `[emailService] No email provider succeeded — OTP for ${toEmail} = ${otp}\n` +
+    '  → Either rotate SENDGRID_API_KEY on Render (Settings → API Keys → Create)\n' +
+    '  → OR add BREVO_API_KEY + BREVO_FROM env vars (signup at https://www.brevo.com/free-sendinblue-account/)'
   );
   return {
     sent:  false,
-    error: 'Email provider not configured. Set SENDGRID_API_KEY + SENDGRID_FROM on Render.',
+    error: sgError
+      ? `Email provider rejected the request (${sgError.message}). Rotate the SendGrid API key on Render, or configure BREVO_API_KEY as a fallback.`
+      : 'Email provider not configured. Set SENDGRID_API_KEY + SENDGRID_FROM (or BREVO_API_KEY + BREVO_FROM) on Render.',
     provider: 'none',
   };
 }
@@ -186,6 +268,13 @@ function getStatus() {
       hasFrom:    !!process.env.SENDGRID_FROM,
       from:       process.env.SENDGRID_FROM || null,
       fromName:   process.env.SENDGRID_FROM_NAME || null,
+    },
+    brevo: {
+      configured: hasBrevo(),
+      hasApiKey:  !!process.env.BREVO_API_KEY,
+      hasFrom:    !!process.env.BREVO_FROM,
+      from:       process.env.BREVO_FROM || null,
+      fromName:   process.env.BREVO_FROM_NAME || null,
     },
   };
 }
