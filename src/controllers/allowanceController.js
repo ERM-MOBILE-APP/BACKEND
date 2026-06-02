@@ -262,8 +262,28 @@ exports.getSummary = async (req, res) => {
       totalDistance: 0,
       totalCount: inMonth.length,
     };
+    // Updated Jun 2026 — sum the partial breakdown fields when the
+    // manager / HR has acted, so a ₹150 claim approved at ₹100 shows
+    // ₹100 under Approved and ₹50 under Rejected (not ₹150 under
+    // Approved). Pending stays "what's still in review".
     inMonth.forEach((a) => {
-      if (summary[a.status] !== undefined) summary[a.status] += a.amount || 0;
+      const claim    = Number(a.amount) || 0;
+      const approved = Number(a.approvedAmount) || 0;
+      const rejected = Number(a.rejectedAmount) || 0;
+      if (a.status === 'approved') {
+        // HR finalized — split if a partial was recorded; full-approve otherwise.
+        if (approved > 0 || rejected > 0) {
+          summary.approved += approved;
+          summary.rejected += rejected;
+        } else {
+          summary.approved += claim;
+        }
+      } else if (a.status === 'rejected') {
+        summary.rejected += claim;
+      } else {
+        // Still awaiting decision — counts toward Pending in full.
+        summary.pending += claim;
+      }
       summary.totalDistance += a.distance || 0;
     });
     summary.totalDistance = Math.round(summary.totalDistance);

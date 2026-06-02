@@ -799,14 +799,19 @@ exports.adminUpdateRequest = async (req, res) => {
     const fresh = await AttendanceRequest.findByIdAndUpdate(req.params.id, update, { new: true })
       .populate('user', 'firstName lastName name employeeId email');
     if (!fresh) return res.status(404).json({ message: 'Request not found' });
-    // Notify the employee so the bell updates.
+    // Notify the employee so the bell updates. Attribution defaults to
+    // "by HR" because this endpoint is what HRMS hits; the body
+    // distinguishes the HR final call from the manager's earlier
+    // decision (the manager's notification fires from ERM Web's
+    // manager.actAttendanceRequest path with its own copy).
     try {
       const { notify } = require('../utils/notify');
       const verb = update.status === 'approved' ? 'approved' :
                    update.status === 'rejected' ? 'rejected' : 'pending';
+      const by = reviewedBy && /manager/i.test(reviewedBy) ? 'your manager' : 'HR';
       await notify(fresh.user?._id || fresh.user, {
-        title: `Attendance request ${verb}`,
-        body:  `Your attendance regularisation for ${fresh.date} was ${verb}` +
+        title: `Attendance request ${verb} by ${by}`,
+        body:  `Your attendance regularisation for ${fresh.date} was ${verb} by ${by}` +
                (hrComment ? `. Note: "${hrComment}"` : '.'),
         type:  'attendance',
         link:  '/(tabs)/attendance',
@@ -1458,7 +1463,6 @@ exports.adminDailyRoute = async (req, res) => {
     // Allowance overlay — if this employee filed a travel/petrol claim
     // on the date, surface the from/to pins so the map can render F + T
     // markers alongside the GPS polyline.
-    const Allowance = require('../models/Allowance');
     const allow = await Allowance.findOne({ user: user._id, date }).lean();
     const allowanceShape = allow ? {
       fromLocation: allow.fromLocation,

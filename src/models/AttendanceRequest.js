@@ -27,8 +27,23 @@ const attendanceRequestSchema = new mongoose.Schema(
       enum: ['pending', 'approved', 'rejected', 'expired'],
       default: 'pending',
     },
+    // Manager-tier decision (Jun 2026). Mirrors the same pattern Leave +
+    // Allowance use:
+    //   • '' (empty)   -> Awaiting Manager. Visible to BOTH the manager
+    //                    (ERM Web) and HR (HRMS).
+    //   • 'Approved'   -> Manager approved. HR now has the final call
+    //                    (status stays 'pending'). HR sees an actionable
+    //                    row in HRMS Attendance Requests.
+    //   • 'Rejected'   -> Manager rejected. Request short-circuits -- HR
+    //                    doesn't need to act; status flips to 'rejected'
+    //                    at the same time.
+    managerStatus:    { type: String, enum: ['', 'Approved', 'Rejected'], default: '' },
+    managerStatusBy:  { type: String, default: '' },
+    managerStatusAt:  { type: Date,   default: null },
+    managerComment:   { type: String, default: '' },
     reviewedBy: { type: String, default: '' },
     reviewedAt: { type: Date },
+    hrComment:  { type: String, default: '' },
   },
   { timestamps: true }
 );
