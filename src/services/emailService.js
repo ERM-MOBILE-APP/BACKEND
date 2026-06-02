@@ -207,8 +207,16 @@ async function sendOtpEmail(toEmail, otp) {
   const subject  = `Your Tesco ERM password reset code: ${otp}`;
   const text     = `Your Tesco ERM OTP is ${otp}. Valid for 10 minutes. Do not share this code.`;
 
+  // Force-Brevo escape hatch (Jun 2026). Set DISABLE_SENDGRID=1 on
+  // Render to skip SendGrid entirely while ops debugs the key/sender
+  // verification — OTPs keep flowing through Brevo without a code
+  // change. Setting EMAIL_PROVIDER=brevo has the same effect.
+  const skipSendGrid =
+    /^(1|true|yes)$/i.test(process.env.DISABLE_SENDGRID || '') ||
+    /^brevo$/i.test(process.env.EMAIL_PROVIDER || '');
+
   let sgError = null;
-  if (hasSendGrid()) {
+  if (hasSendGrid() && !skipSendGrid) {
     try {
       provider = 'sendgrid';
       const data = await sendViaSendGrid(toEmail, subject, html, text);
@@ -217,13 +225,16 @@ async function sendOtpEmail(toEmail, otp) {
     } catch (err) {
       sgError = err;
       console.error('[emailService] SendGrid FAILED:', err.message);
-      // Only fall through to Brevo on auth / sender issues (4xx). A 5xx
-      // is a transient outage — we shouldn't retry through a different
-      // provider and risk a double-send when SendGrid recovers.
-      if (!(err.status >= 400 && err.status < 500)) {
-        return { sent: false, error: err.message, provider: 'sendgrid' };
-      }
+      // Updated Jun 2026 — fall through to Brevo on ANY error, not just
+      // 4xx. A stale-key 401 (the most common cause) was already handled
+      // but operators were still seeing real outages slip through when
+      // SendGrid returned 5xx during a rotation. Always trying Brevo is
+      // strictly safer: it only sends when SendGrid clearly didn't,
+      // and the worst case is a duplicate email if SendGrid recovers
+      // mid-request (which we accept over a missed OTP).
     }
+  } else if (skipSendGrid) {
+    console.log('[emailService] Skipping SendGrid (DISABLE_SENDGRID / EMAIL_PROVIDER=brevo).');
   }
 
   if (hasBrevo()) {
@@ -243,22 +254,32 @@ async function sendOtpEmail(toEmail, otp) {
 
   // No provider succeeded. Log the OTP so dev can still test, and bubble
   // a useful error message back to the controller (which converts it
-  // into the alert the user sees).
+  // into the alert the user sees). The hint expands to include the
+  // "env var didn't redeploy" gotcha that bites people who rotated
+  // their SendGrid key but forgot Render needs a redeploy / manual
+  // restart to pick up the new value.
   console.error(
     `[emailService] No email provider succeeded — OTP for ${toEmail} = ${otp}\n` +
-    '  → Either rotate SENDGRID_API_KEY on Render (Settings → API Keys → Create)\n' +
-    '  → OR add BREVO_API_KEY + BREVO_FROM env vars (signup at https://www.brevo.com/free-sendinblue-account/)'
+    `  SendGrid error: ${sgError ? sgError.message : 'not configured'}\n` +
+    '  Recovery steps:\n' +
+    '   1. On Render → Environment, confirm SENDGRID_API_KEY matches the value\n' +
+    '      from your SendGrid dashboard exactly (no leading "Bearer ", no spaces).\n' +
+    '   2. Save the env var AND trigger a redeploy — Render does NOT hot-reload\n' +
+    '      env changes; the running container still uses the old value otherwise.\n' +
+    '   3. Verify the sender at SendGrid -> Settings -> Sender Authentication.\n' +
+    '   4. As a backup, configure BREVO_API_KEY + BREVO_FROM and (optionally)\n' +
+    '      set DISABLE_SENDGRID=1 to route every OTP through Brevo.'
   );
   return {
     sent:  false,
     error: sgError
-      ? `Email provider rejected the request (${sgError.message}). Rotate the SendGrid API key on Render, or configure BREVO_API_KEY as a fallback.`
-      : 'Email provider not configured. Set SENDGRID_API_KEY + SENDGRID_FROM (or BREVO_API_KEY + BREVO_FROM) on Render.',
+      ? `Couldn't send OTP. ${sgError.message}. Check that SENDGRID_API_KEY on Render matches your dashboard, then redeploy (env changes don't hot-reload). Configure BREVO_API_KEY for an automatic fallback.`
+      : 'Email provider not configured. Set SENDGRID_API_KEY + SENDGRID_FROM (or BREVO_API_KEY + BREVO_FROM) on Render and redeploy.',
     provider: 'none',
   };
 }
 
-// ─── Status endpoint ─────────────────────────────────────────────────────────
+// ___ Status endpoint __________________________________________________________
 function getStatus() {
   return {
     activeProvider: provider,
