@@ -108,6 +108,9 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
+// Health probe used by keepAlive.js self-pinger.
+app.get('/api/_health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   // Kick off the keep-alive cron once the server is up
