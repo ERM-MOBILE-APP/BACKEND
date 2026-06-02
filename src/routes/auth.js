@@ -8,6 +8,7 @@ const {
   resetPassword,
   changePassword,
   emailStatus,
+  testEmail,
   version,
   whoami,
   adminListUsers,
@@ -28,7 +29,8 @@ router.post('/reset-password',  resetPassword);
 router.post('/change-password', auth, changePassword);
 
 // ─── Diagnostic ────────────────────────────────────────────────────────
-router.get('/email-status',     emailStatus);
+router.get('/email-status',     emailStatus,
+  testEmail);
 router.get('/version',          version);
 router.get('/whoami',           whoami);
 

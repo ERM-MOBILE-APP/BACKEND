@@ -451,6 +451,41 @@ exports.emailStatus = (req, res) => {
 };
 
 /**
+ * GET /api/auth/test-email?to=you@example.com
+ *
+ * Fires a one-off test email through whichever provider is configured
+ * AND returns the live result + any provider error verbatim. Hit this
+ * from a browser whenever OTPs aren't arriving — the response tells
+ * you exactly why (invalid key, unverified sender, rate-limit, etc.)
+ * instead of forcing you to dig through Render logs.
+ *
+ * Disabled in production unless `ALLOW_TEST_EMAIL=1` is set, so a
+ * stranger can't quietly burn through your free-tier email quota.
+ */
+exports.testEmail = async (req, res) => {
+  if (process.env.NODE_ENV === 'production' && process.env.ALLOW_TEST_EMAIL !== '1') {
+    return res.status(403).json({
+      ok: false,
+      message: 'Test endpoint disabled in production. Set ALLOW_TEST_EMAIL=1 on Render to enable.',
+    });
+  }
+  const to = String(req.query.to || '').trim();
+  if (!to) return res.status(400).json({ ok: false, message: 'Pass ?to=you@example.com' });
+  const otp = '000000';
+  const out = await sendOtpEmail(to, otp);
+  res.json({
+    ok:           !!out.sent,
+    provider:     out.provider,
+    info:         out.info || null,
+    error:        out.error || null,
+    status:       getStatus(),
+    note:         out.sent
+      ? `Sent via ${out.provider}. Check ${to}'s inbox (and spam folder).`
+      : 'Email provider rejected the request — see "error" above for the verbatim provider reply.',
+  });
+};
+
+/**
  * Returns the running code version for this controller. Use this to confirm
  * Render has actually picked up your latest deploy — bump AUTH_CODE_VERSION
  * at the top of this file every time you change auth logic.
