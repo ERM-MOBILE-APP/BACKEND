@@ -218,43 +218,59 @@ exports.login = async (req, res) => {
  */
 exports.sendOtp = async (req, res) => {
   const { email } = req.body;
-  if (!email) return res.status(400).json({ message: 'Email is required' });
+  if (!email) return res.status(400).json({ message: 'Email or User ID is required' });
 
   try {
     const normalized = email.toLowerCase().trim();
 
-    // Lenient mode — send OTP to ANY email address the user enters.
-    // We do NOT 404 here, even when no User matches, because:
-    //   • the User collection's `email` field is often blank
-    //   • users may log in with an email-shaped `userId`
-    //   • blocking here makes forgot-password feel broken for valid accounts
-    // The flexible lookup in resetPassword handles "does this account
-    // actually exist" at the right moment (after the user has proven they
-    // own the inbox by typing back the OTP).
+    // Lenient mode — accept ANY input the user types: email, userId
+    // (TES047), local-part of email, etc. The findUserByEmailOrUserId
+    // helper does all the variations. We DON'T 404 here even when no
+    // user matches, because forgot-password should still attempt a
+    // send so we don't leak which inputs do or don't have an account.
     const user = await findUserByEmailOrUserId(normalized);
     if (!user) {
       console.warn(`[sendOtp] no User record for ${normalized} — sending OTP anyway`);
     } else {
-      console.log(`[sendOtp] matched user ${user.userId} for ${normalized}`);
+      console.log(`[sendOtp] matched user ${user.userId} for ${normalized} (email on file: ${user.email || '(empty)'})`);
     }
+
+    // Critical fix (Jun 2026): send the OTP to the REGISTERED email on
+    // the user's HR record, NOT to whatever the user typed at the
+    // forgot-password screen. Two reasons:
+    //   1. Users routinely type their userId (TES047) — sending an OTP
+    //      to "tes047@<domain>" obviously fails since no such inbox
+    //      exists.
+    //   2. Even when they type an email, it might be different from
+    //      what HR registered. Always sending to the registered email
+    //      eliminates a whole class of "OTP never arrives" support
+    //      tickets.
+    // Fallback: if the user has no email field populated, fall back to
+    // the typed input — keeps brand-new HR-created accounts working.
+    const destEmail = (user && user.email && String(user.email).trim())
+      ? String(user.email).trim().toLowerCase()
+      : normalized;
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const expiresAt = Date.now() + OTP_TTL_MS;
-    otpStore.set(normalized, {
-      otp,
-      expiresAt,
-      attempts: 0,
-      userId: user ? user._id : null,
-    });
+    // Key the OTP store by BOTH the typed input and the destination
+    // email so verifyOtp can look it up either way. This lets the
+    // employee paste back the OTP using whatever they typed originally.
+    const entry = { otp, expiresAt, attempts: 0, userId: user ? user._id : null, destEmail };
+    otpStore.set(normalized, entry);
+    if (destEmail !== normalized) otpStore.set(destEmail, entry);
 
-    console.log(`[sendOtp] generated OTP for ${normalized}: ${otp}`);
+    console.log(`[sendOtp] generated OTP for ${normalized} → delivering to ${destEmail}: ${otp}`);
 
-    const result = await sendOtpEmail(normalized, otp);
+    const result = await sendOtpEmail(destEmail, otp);
 
     if (result.sent) {
+      // Don't echo the full email back if it differs from what the user
+      // typed — privacy. Just confirm a send happened.
+      const masked = destEmail.replace(/^(.{2}).*(@.*)$/, '$1***$2');
       return res.json({
         success: true,
-        message: `OTP sent to ${email}. Please check your inbox (and spam folder).`,
+        message: `OTP sent to ${masked}. Please check your inbox (and spam folder).`,
       });
     }
 
@@ -800,7 +816,7 @@ exports.adminUpdateUser = async (req, res) => {
 
     await User.updateOne({ _id: user._id }, { $set: updates });
     const fresh = await User.findById(user._id).select('-password');
-    console.log(`[adminUpdateUser] ✓ updated userId=${user.userId} fields=${Object.keys(updates).join(',')}`);
+    console.log(`[adminUpdateUser] OK updated userId=${user.userId} fields=${Object.keys(updates).join(',')}`);
     return res.json({ message: 'User updated.', user: fresh });
   } catch (err) {
     console.error('[adminUpdateUser]', err);
@@ -816,7 +832,7 @@ exports.adminDeleteUser = async (req, res) => {
   try {
     const u = await User.findOneAndDelete({ userId: req.params.userId });
     if (!u) return res.status(404).json({ message: `No user with userId "${req.params.userId}".` });
-    console.log(`[adminDeleteUser] ✓ deleted userId=${u.userId}`);
+    console.log(`[adminDeleteUser] OK deleted userId=${u.userId}`);
     return res.json({ message: 'User deleted.', userId: u.userId });
   } catch (err) {
     console.error('[adminDeleteUser]', err);
@@ -826,8 +842,6 @@ exports.adminDeleteUser = async (req, res) => {
 
 /**
  * GET /api/auth/admin/users/:userId/leave-policy
- * Returns this-month leave/permission usage + LOP for the user, using the
- * same shared module as the mobile attendance/profile screens.
  */
 exports.adminLeavePolicy = async (req, res) => {
   if (!checkAdmin(req, res)) return;
