@@ -4,6 +4,11 @@ const Leave = require('../models/Leave');
 const AttendanceRequest = require('../models/AttendanceRequest');
 const LocationPing = require('../models/LocationPing');
 const User = require('../models/User');
+const Allowance = require('../models/Allowance');
+const {
+  isPetrolGpsEmployee,
+  PETROL_RATE_RUPEES_PER_KM,
+} = require('../petrolGpsAllowlist');
 
 const isObjId = (v) => v && typeof v === 'string' && /^[a-f0-9]{24}$/i.test(v);
 
@@ -327,8 +332,9 @@ exports.checkOut = async (req, res) => {
     // allowance request. The polyline isn't stored (would bloat the
     // row); HR can re-fetch it from LocationPings on demand via the
     // /admin/daily-route endpoint.
+    let dayRoute = null;
     try {
-      const route = await buildDailyRoute(req.user.id, date, {
+      dayRoute = await buildDailyRoute(req.user.id, date, {
         checkIn:     record.checkIn,
         checkOut:    now,
         checkInLat:  record.checkInLat,
@@ -336,13 +342,73 @@ exports.checkOut = async (req, res) => {
         checkOutLat,
         checkOutLng,
       });
-      record.totalDistanceKm = route.distanceKm;
-      record.distanceSource  = route.source;
+      record.totalDistanceKm = dayRoute.distanceKm;
+      record.distanceSource  = dayRoute.source;
     } catch (e) {
       console.warn('[checkOut] distance compute failed:', e.message);
     }
 
     await record.save();
+
+    // ─── Auto petrol-allowance request on check-out (Jun 2026) ────────
+    // For employees flagged petrolEligible (set on the Employee record
+    // in HRMS' Add Employee form), every successful check-out now drops
+    // one petrol allowance row into the queue with:
+    //   distance = GPS km between checkIn→checkOut polyline
+    //   amount   = distance × PETROL_RATE_RUPEES_PER_KM  (₹3.50/km)
+    //   route    = first ping → last ping (or check-in/out pins fallback)
+    // The row lands as managerStatus '' (Awaiting Manager) + status
+    // 'pending' so it follows the same Manager → HR flow as a
+    // hand-submitted travel/petrol request. We dedupe on (user, date,
+    // type='petrol') so a second checkout (after admin reopen, say)
+    // won't double-bill.
+    try {
+      const userDoc = await User.findById(req.user.id)
+        .select('petrolEligible firstName lastName name department departmentName')
+        .lean();
+      if (userDoc && isPetrolGpsEmployee(userDoc) && dayRoute && dayRoute.distanceKm > 0) {
+        const already = await Allowance.findOne({
+          user: req.user.id,
+          date,
+          type: 'petrol',
+        }).select('_id').lean();
+        if (!already) {
+          const km     = Number(dayRoute.distanceKm) || 0;
+          const amount = Math.round(km * PETROL_RATE_RUPEES_PER_KM * 100) / 100;
+          const fmt    = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(5) : '—';
+          const fromLoc = dayRoute.from
+            ? `Check-in (${fmt(dayRoute.from.lat)}, ${fmt(dayRoute.from.lng)})`
+            : 'Check-in';
+          const toLoc = dayRoute.to
+            ? `Check-out (${fmt(dayRoute.to.lat)}, ${fmt(dayRoute.to.lng)})`
+            : 'Check-out';
+          await Allowance.create({
+            user:           req.user.id,
+            type:           'petrol',
+            purpose:        'Daily field work (auto-billed from GPS)',
+            fromLocation:   fromLoc,
+            toLocation:     toLoc,
+            date,
+            transport:      'Bike',
+            distance:       km,
+            distanceSource: 'gps',
+            fromLat:        dayRoute.from ? dayRoute.from.lat : null,
+            fromLng:        dayRoute.from ? dayRoute.from.lng : null,
+            toLat:          dayRoute.to ? dayRoute.to.lat : null,
+            toLng:          dayRoute.to ? dayRoute.to.lng : null,
+            amount,
+            typedAmount:    amount, // matches `amount` since this is system-generated
+            notes:          `Auto-generated on check-out. Distance ${km.toFixed(2)} km × ₹${PETROL_RATE_RUPEES_PER_KM}/km.`,
+            managerStatus:  '',
+            status:         'pending',
+          });
+        }
+      }
+    } catch (e) {
+      // Non-fatal — checkout itself succeeded; HR can still file the
+      // claim manually if this cron misfires.
+      console.warn('[checkOut] petrol auto-bill skipped:', e.message);
+    }
 
     // Mark the user offline + drop a final LocationPing at the checkout
     // coords (if available). The HRMS Live Tracking page uses this last

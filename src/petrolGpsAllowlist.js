@@ -34,12 +34,19 @@ function normalize(s) {
 }
 
 // Does this user object belong to the GPS-petrol allowlist?
-//   • Full name match wins.
-//   • First-name match wins (so "Praveen" matches "Praveen Raja").
-//   • Anyone whose department is exactly 'sales' or 'execution' also
-//     qualifies — that's the department-level rule HR set in May 2026.
+//
+// Resolution order (most specific wins):
+//   1. The per-employee `petrolEligible` flag — set explicitly by HR
+//      from the New Employee form (Jun 2026). `true` opts the
+//      employee in even if their dept/name wouldn't otherwise match,
+//      `false` opts them out even if their dept/name would.
+//   2. Full name match in PETROL_GPS_NAMES.
+//   3. First-name match (so "Praveen" matches "Praveen Raja").
+//   4. Department is exactly 'sales' or 'execution'.
 exports.isPetrolGpsEmployee = function (user) {
   if (!user) return false;
+  // Per-employee flag wins — it's an explicit HR decision, not a heuristic.
+  if (typeof user.petrolEligible === 'boolean') return user.petrolEligible;
   const dept = normalize(user.department && user.department.name) ||
                normalize(user.departmentName) ||
                normalize(user.department);

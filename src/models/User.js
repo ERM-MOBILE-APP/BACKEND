@@ -51,6 +51,11 @@ const userSchema = new mongoose.Schema(
     joiningDate:{ type: Date },
     salary:     { type: Number, default: 0 },
     assignedTo: { type: String, default: '' },
+    // Per-employee petrol-allowance opt-in (Jun 2026 HR brief). Mirrors
+    // the same flag on HRMS Backend/models/Employee.js — we keep both
+    // schemas in sync because the User collection is what the mobile
+    // backend's auto-bill cron reads against.
+    petrolEligible: { type: Boolean, default: undefined },
     education:  { type: mongoose.Schema.Types.Mixed },
     status:     { type: String, default: 'Active' },
     isActive:   { type: Boolean, default: true },
