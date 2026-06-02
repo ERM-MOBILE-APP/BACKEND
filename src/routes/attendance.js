@@ -20,6 +20,8 @@ const {
   adminLiveLocations,
   adminDailyRoute,
   adminDailyRoutesList,
+  adminListRequests,
+  adminUpdateRequest,
 } = require('../controllers/attendanceController');
 
 router.post ('/checkin',       auth, checkIn);
@@ -43,6 +45,10 @@ router.get  ('/ping-history',  auth, pingHistory);      // HR / audit view
 // Uses x-admin-secret header instead of JWT (HRMS backend → mobile backend).
 
 router.get  ('/admin/all',             adminListAll);
+// Admin endpoints for attendance regularisation requests — used by
+// HRMS proxy AND by ERM Web's manager queue.
+router.get  ('/admin/requests',         adminListRequests);
+router.patch('/admin/requests/:id',     adminUpdateRequest);
 router.get  ('/admin/live-locations',  adminLiveLocations);
 
 // Daily route map + km for one employee on one date — the petrol section

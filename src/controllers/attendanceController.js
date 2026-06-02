@@ -675,6 +675,86 @@ exports.listRequests = async (req, res) => {
   }
 };
 
+// ─── Admin: list ALL attendance requests across users ─────────────────
+//
+// GET /api/attendance/admin/requests?status=pending|approved|rejected|expired&limit=
+// Auth: x-admin-secret header (HRMS proxy uses this).
+//
+// HR wanted a single endpoint to see every employee's regularisation
+// request without paging through each employee individually. The list
+// is enriched with the requester's name + employee id sidecar so the
+// HRMS UI can render rows without a second lookup.
+exports.adminListRequests = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected) return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+  try {
+    await closeStaleAttendanceRequests({});
+    const filter = {};
+    const status = String(req.query.status || '').toLowerCase();
+    if (['pending', 'approved', 'rejected', 'expired'].includes(status)) {
+      filter.status = status;
+    }
+    const limit = Math.min(parseInt(req.query.limit, 10) || 500, 2000);
+    const items = await AttendanceRequest.find(filter)
+      .populate('user', 'firstName lastName name employeeId email designation department designationTitle departmentName')
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json({ items });
+  } catch (err) {
+    console.error('[attendance.adminListRequests]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+// PATCH /api/attendance/admin/requests/:id   { status, hrComment?, reviewedBy? }
+//
+// HR (via HRMS) or the employee's manager (via ERM Web) updates the
+// status. Fires a Notification on the row so the employee's bell badge
+// updates in real time.
+exports.adminUpdateRequest = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected) return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+  try {
+    const { status, hrComment, reviewedBy } = req.body || {};
+    if (!['approved', 'rejected', 'pending'].includes(String(status || '').toLowerCase())) {
+      return res.status(400).json({ message: 'status must be approved, rejected, or pending' });
+    }
+    const update = {
+      status: String(status).toLowerCase(),
+      reviewedAt: new Date(),
+    };
+    if (typeof hrComment === 'string')  update.hrComment  = hrComment;
+    if (typeof reviewedBy === 'string') update.reviewedBy = reviewedBy;
+    const fresh = await AttendanceRequest.findByIdAndUpdate(req.params.id, update, { new: true })
+      .populate('user', 'firstName lastName name employeeId email');
+    if (!fresh) return res.status(404).json({ message: 'Request not found' });
+    // Notify the employee so the bell updates.
+    try {
+      const { notify } = require('../utils/notify');
+      const verb = update.status === 'approved' ? 'approved' :
+                   update.status === 'rejected' ? 'rejected' : 'pending';
+      await notify(fresh.user?._id || fresh.user, {
+        title: `Attendance request ${verb}`,
+        body:  `Your attendance regularisation for ${fresh.date} was ${verb}` +
+               (hrComment ? `. Note: "${hrComment}"` : '.'),
+        type:  'attendance',
+        link:  '/(tabs)/attendance',
+      });
+    } catch (notifyErr) {
+      console.warn('[attendance.adminUpdateRequest] notify failed:', notifyErr.message);
+    }
+    res.json({ item: fresh });
+  } catch (err) {
+    console.error('[attendance.adminUpdateRequest]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
 // PATCH /api/attendance/mark   (existing — manual status override)
 exports.markStatus = async (req, res) => {
   try {
@@ -1269,96 +1349,24 @@ exports.adminDailyRoute = async (req, res) => {
       success: true,
       employee: {
         _id:        String(user._id),
-        employeeId: user.employeeId || user.userId || '',
+        employeeId: user.employeeId || '',
         name:       fullName,
         email:      user.email || '',
+        designation: user.designationTitle || user.designation || '',
+        department:  user.departmentName  || user.department  || '',
       },
-      date,
-      checkIn:     att?.checkIn  || null,
-      checkOut:    att?.checkOut || null,
-      checkInLat:  att?.checkInLat  ?? null,
-      checkInLng:  att?.checkInLng  ?? null,
-      checkOutLat: att?.checkOutLat ?? null,
-      checkOutLng: att?.checkOutLng ?? null,
-      totalDistanceKm,
-      distanceSource,
-      polyline: route.polyline,
-      from:     route.from,
-      to:       route.to,
-      allowance,
+      attendance: att ? {
+        date:      att.date,
+        checkIn:   att.checkIn,
+        checkOut:  att.checkOut,
+        status:    att.status,
+        workHours: att.workHours,
+      } : null,
+      route:    poly,
+      allowance: allowanceShape,
     });
   } catch (err) {
-    console.error('attendance.adminDailyRoute error:', err);
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-};
-
-/**
- * GET /api/attendance/admin/daily-routes
- *   ?date=YYYY-MM-DD     (required)
- * Header: x-admin-secret
- *
- * Returns every employee's distance + checkIn/checkOut for the date —
- * lightweight (no polyline), used to populate the "Daily Routes" table
- * in HRMS so HR can pick whose route to drill into.
- */
-exports.adminDailyRoutesList = async (req, res) => {
-  const expected = (process.env.ADMIN_SECRET || '').trim();
-  const got      = (req.headers['x-admin-secret'] || '').trim();
-  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
-  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
-
-  try {
-    const date = String(req.query.date || '').trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return res.status(400).json({ message: 'date=YYYY-MM-DD is required' });
-    }
-
-    const Allowance = require('../models/Allowance');
-    const [rows, allows] = await Promise.all([
-      Attendance.find({ date })
-        .populate('user', 'firstName lastName name employeeId email designation department designationTitle departmentName')
-        .lean(),
-      Allowance.find({ date }).select('user type distance status fromLocation toLocation distanceSource').lean(),
-    ]);
-
-    const allowByUser = new Map();
-    allows.forEach((a) => {
-      const k = String(a.user);
-      if (!allowByUser.has(k)) allowByUser.set(k, []);
-      allowByUser.get(k).push(a);
-    });
-
-    const items = await Promise.all(rows.map(async (r) => {
-      const u = r.user || {};
-      const role = await resolveLabel(u.designation, 'desig').catch(() => '');
-      const dept = await resolveLabel(u.department,  'dept').catch(() => '');
-      const fullName = u.name || ((u.firstName || '') + ' ' + (u.lastName || '')).trim() || 'Unknown';
-      const userAllows = allowByUser.get(String(u._id)) || [];
-      const petrol = userAllows.find((a) => a.type === 'petrol') || null;
-      const travel = userAllows.find((a) => a.type === 'travel') || null;
-      return {
-        userId:         String(u._id),
-        employeeId:     u.employeeId || '',
-        name:           fullName,
-        email:          u.email || '',
-        designation:    role || u.designationTitle || '',
-        department:     dept || u.departmentName   || '',
-        date:           r.date,
-        checkIn:        r.checkIn,
-        checkOut:       r.checkOut,
-        workedHours:    r.workedHours || 0,
-        totalDistanceKm: typeof r.totalDistanceKm === 'number' ? r.totalDistanceKm : 0,
-        distanceSource:  r.distanceSource || 'none',
-        hasAllowance:   userAllows.length > 0,
-        petrol: petrol ? { distance: petrol.distance, status: petrol.status, from: petrol.fromLocation, to: petrol.toLocation } : null,
-        travel: travel ? { distance: travel.distance, status: travel.status, from: travel.fromLocation, to: travel.toLocation } : null,
-      };
-    }));
-
-    res.json({ success: true, date, count: items.length, items });
-  } catch (err) {
-    console.error('attendance.adminDailyRoutesList error:', err);
+    console.error('[attendance.adminDailyRoute]', err);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
