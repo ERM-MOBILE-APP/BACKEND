@@ -6,6 +6,7 @@ const cors = require('cors');
 const compression = require('compression');
 const { startKeepAlive } = require('./keepAlive');
 const { startAutoCloseAttendance } = require('./autoCloseAttendance');
+const { startAutoPetrolBilling } = require('./autoPetrolBilling');
 
 const app = express();
 
@@ -115,6 +116,10 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   // Kick off the keep-alive cron once the server is up
   startKeepAlive(PORT);
-  // Sweep open check-ins at IST midnight → mark as absent.
+  // Sweep open check-ins at IST midnight - mark as absent.
   startAutoCloseAttendance();
+  // Auto-bill petrol for eligible employees every 5 min - no manual
+  // backfill needed. Picks up anyone whose checkout's inline auto-bill
+  // misfired and creates the row automatically.
+  startAutoPetrolBilling();
 });
