@@ -54,6 +54,77 @@ function hoursBetween(start, end) {
   return Math.round((diff / 60) * 100) / 100;
 }
 
+/**
+ * Format an ISO/yyyy-mm-dd string as dd-mm-yyyy for user-facing errors.
+ * Keeps the policy messages consistent with the HRMS-wide date format.
+ */
+function fmtDDMMYYYY(s) {
+  if (!s) return '';
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return String(s);
+  return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+}
+
+/**
+ * Expand a leave date range to the list of YYYY-MM-DD strings it covers.
+ * Used by the duplicate-day check so a leave from Jun 3-Jun 5 also blocks
+ * a permission request for Jun 4.
+ */
+function expandRange(startDate, endDate) {
+  const parse = (s) => {
+    if (!s) return null;
+    const iso = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return new Date(+iso[1], +iso[2] - 1, +iso[3]);
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  };
+  const s = parse(startDate);
+  const e = parse(endDate) || s;
+  if (!s) return [];
+  const out = [];
+  for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    out.push(iso);
+    if (out.length > 90) break;   // safety cap
+  }
+  return out;
+}
+
+/**
+ * Find any non-cancelled leave or permission the user already has on
+ * any of the given dates. Returns the first match or null.
+ *
+ * Used by applyLeave / applyPermission to enforce HR policy:
+ *   - cannot have 2 permissions for the same day
+ *   - cannot have both a leave and a permission for the same day
+ *   - cannot apply for a leave on a day already inside another leave
+ *
+ * 'rejected' and 'cancelled' rows are ignored — they don't block.
+ */
+async function findClashingRequest(userId, dates) {
+  if (!Array.isArray(dates) || dates.length === 0) return null;
+  // Pull every non-final-rejected row in one query then filter in JS — far
+  // cheaper than N queries per date when the user has a long leave history.
+  const rows = await Leave.find({
+    user: userId,
+    status: { $nin: ['rejected', 'cancelled'] },
+  }).lean();
+
+  const want = new Set(dates);
+  for (const r of rows) {
+    if (r.requestType === 'permission') {
+      const d = String(r.date || '').slice(0, 10);
+      if (d && want.has(d)) return r;
+    } else if (r.requestType === 'leave') {
+      const span = expandRange(r.startDate, r.endDate);
+      for (const d of span) if (want.has(d)) return r;
+    }
+  }
+  return null;
+}
+
 // POST /api/leave/apply
 exports.applyLeave = async (req, res) => {
   try {
@@ -61,6 +132,28 @@ exports.applyLeave = async (req, res) => {
     if (!leaveType || !startDate || !endDate || !reason) {
       return res.status(400).json({ message: 'Missing required fields' });
     }
+
+    // ── Same-day clash check ──────────────────────────────────────────
+    // Block if any day in the requested range already has a leave or
+    // permission on file (pending or approved). Returns 409 + a message
+    // that names the clashing day in dd-mm-yyyy.
+    const dates = expandRange(startDate, endDate);
+    const clash = await findClashingRequest(req.user.id, dates);
+    if (clash) {
+      const clashDay = clash.requestType === 'permission'
+        ? clash.date
+        : (dates.find(d => expandRange(clash.startDate, clash.endDate).includes(d)) || clash.startDate);
+      return res.status(409).json({
+        code: 'ALREADY_REQUESTED',
+        message: `Already requested for ${fmtDDMMYYYY(clashDay)}`,
+        existing: {
+          id: String(clash._id),
+          type: clash.requestType,
+          status: clash.status,
+        },
+      });
+    }
+
     const leave = await Leave.create({
       user: req.user.id,
       requestType: 'leave',
@@ -97,6 +190,25 @@ exports.applyPermission = async (req, res) => {
     if (hours <= 0) {
       return res.status(400).json({ message: 'End time must be after start time.' });
     }
+
+    // ── Same-day clash check ──────────────────────────────────────────
+    // Policy: only one permission per day, and no permission on a day
+    // already covered by a leave. Returns 409 with a friendly message
+    // so the UI can render a "Already requested for {date}" pop-up.
+    const dayIso = String(date).slice(0, 10);
+    const clash = await findClashingRequest(req.user.id, [dayIso]);
+    if (clash) {
+      return res.status(409).json({
+        code: 'ALREADY_REQUESTED',
+        message: `Already requested for ${fmtDDMMYYYY(dayIso)}`,
+        existing: {
+          id: String(clash._id),
+          type: clash.requestType,
+          status: clash.status,
+        },
+      });
+    }
+
     const permission = await Leave.create({
       user: req.user.id,
       requestType: 'permission',

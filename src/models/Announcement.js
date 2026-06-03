@@ -42,6 +42,18 @@ const announcementSchema = new mongoose.Schema(
       ],
       default: [],
     },
+
+    // ── Per-user read tracking (Jun 2026) ─────────────────────────────
+    // Mirrors the notifications screen behaviour: tapping a card marks
+    // the announcement read for THIS user only. Other employees still
+    // see it as unread until they open it. We store user IDs as
+    // ObjectIds so $addToSet works against the employees collection
+    // without string-coercion churn.
+    readBy: {
+      type: [mongoose.Schema.Types.ObjectId],
+      default: [],
+      index: true,
+    },
   },
   { timestamps: true, strict: false }
 );

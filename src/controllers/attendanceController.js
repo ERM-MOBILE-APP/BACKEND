@@ -280,42 +280,55 @@ exports.checkOut = async (req, res) => {
     record.workedHours =
       Math.round(((record.checkOut - record.checkIn) / 3600000) * 100) / 100;
 
-    // ─── Early-checkout policy ────────────────────────────────────────
-    // Standard workday is ~8 hrs. If the employee leaves with less than
-    // ~6.5 hrs on the clock, treat it as a partial day:
-    //   • If they filed a Permission for today → status stays whatever
-    //     the day was (present/late); LOP rule counts each permission
-    //     against the 2-per-month policy. Permission already documents
-    //     why they left early.
-    //   • If they did NOT file a Permission → mark the row as 'halfday'.
-    //     The LOP rule treats every halfday over the 2-per-month quota
-    //     as 0.5 LOP, so habitual early-leavers still hit the policy.
-    const SHORT_DAY_HOURS = 6.5;
-    if (record.workedHours < SHORT_DAY_HOURS) {
-      let hadPermission = false;
+    // ─── Early-checkout policy (Jun 2026 — wall-clock 5:30 PM IST) ────
+    // HR's standard end-of-day is 5:30 PM IST. If the employee taps
+    // Check Out BEFORE 5:30 PM IST, treat it as a short day:
+    //   • If HR has APPROVED a Permission for today → status stays
+    //     whatever the day was (present / late). The permission already
+    //     documents and justifies the early departure.
+    //   • If there is no permission OR the permission is still pending /
+    //     rejected → mark the row 'halfday' with earlyCheckoutLop=true.
+    //     The LOP rule (utils/leavePolicy) counts each halfday as 0.5 LOP
+    //     once the employee crosses the 2-per-month free quota.
+    //
+    // Only an APPROVED permission excuses the early checkout. A pending
+    // request that HR may later reject MUST NOT pre-emptively excuse the
+    // employee — otherwise an employee could create a fake permission
+    // request at 4 PM, leave at 4:30 PM, and dodge LOP even if HR rejects
+    // it the next morning.
+    const istParts2 = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour:   '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+    const coHour   = parseInt(istParts2.find(p => p.type === 'hour')?.value   || '0', 10);
+    const coMinute = parseInt(istParts2.find(p => p.type === 'minute')?.value || '0', 10);
+    const isEarlyCheckout = coHour < 17 || (coHour === 17 && coMinute < 30);
+
+    if (isEarlyCheckout) {
+      let hadApprovedPermission = false;
       try {
         const perm = await Leave.findOne({
           user: req.user.id,
           requestType: 'permission',
           date,
-          status: { $in: ['approved', 'pending'] },
+          status: 'approved',     // ONLY HR-approved permission excuses it
         }).lean();
-        hadPermission = !!perm;
-      } catch { /* if the lookup fails, fall through and assume no permission */ }
+        hadApprovedPermission = !!perm;
+      } catch { /* fall through and treat as no permission */ }
 
-      if (!hadPermission) {
-        // No permission on file → half-day LOP. We also stamp an
-        // explicit `earlyCheckoutLop` flag so the leavePolicy module
-        // can count it cleanly without depending on the status enum.
+      if (!hadApprovedPermission) {
         record.status = 'halfday';
         record.earlyCheckoutLop = true;
+      } else {
+        // Approved permission on file — early checkout is excused.
+        record.earlyCheckoutLop = false;
       }
-      // If the employee DID have an approved-or-pending permission, the
-      // early checkout is excused — clear any lingering flag from a
-      // prior bad close.
-      if (hadPermission) record.earlyCheckoutLop = false;
-      // If hadPermission, leave the status untouched — the day is
-      // accounted for via the permission row.
+    } else {
+      // Checked out at or after 5:30 PM — definitely not an early-out.
+      // Clear any stale flag in case the row got re-saved.
+      record.earlyCheckoutLop = false;
     }
 
 

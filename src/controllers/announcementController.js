@@ -61,9 +61,64 @@ exports.list = async (req, res) => {
       const attCount = items.reduce((s, r) => s + (Array.isArray(r?.attachments) ? r.attachments.length : 0), 0);
       console.log(`[announcement.list] returning ${items.length} rows, total attachments=${attCount}`);
     } catch { /* logging is best-effort */ }
-    res.json(items);
+
+    // ── Per-user isRead projection (Jun 2026) ─────────────────────────
+    // The mobile Announcements screen now mirrors the Notifications
+    // design — each card needs a per-user read/unread state. We compute
+    // isRead = (current user's _id is in this announcement's readBy
+    // array) and inject it on the response. Strip the (potentially
+    // large) readBy array before sending so the wire payload stays slim.
+    const meId = req.user && req.user.id ? String(req.user.id) : '';
+    const shaped = items.map((r) => {
+      const readBy = Array.isArray(r.readBy) ? r.readBy.map(String) : [];
+      const isRead = meId ? readBy.includes(meId) : false;
+      const { readBy: _omit, ...rest } = r;
+      return { ...rest, isRead };
+    });
+    res.json(shaped);
   } catch (err) {
     console.error('announcement.list error:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/announcement/:id/read
+ * Adds the current user's _id to this announcement's readBy array.
+ * Idempotent via $addToSet. Mirrors the mobile notifications screen's
+ * tap-to-read behaviour.
+ */
+exports.markRead = async (req, res) => {
+  try {
+    if (!req.user || !req.user.id) return res.status(401).json({ message: 'Unauthorized' });
+    const updated = await Announcement.findByIdAndUpdate(
+      req.params.id,
+      { $addToSet: { readBy: req.user.id } },
+      { new: true },
+    ).lean();
+    if (!updated) return res.status(404).json({ message: 'Not found' });
+    res.json({ success: true, _id: updated._id, isRead: true });
+  } catch (err) {
+    console.error('announcement.markRead error:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * PATCH /api/announcement/read-all
+ * Marks every currently-active announcement as read for THIS user.
+ * Cheap one-shot bulk op for the "mark all read" button.
+ */
+exports.markAllRead = async (req, res) => {
+  try {
+    if (!req.user || !req.user.id) return res.status(401).json({ message: 'Unauthorized' });
+    const r = await Announcement.updateMany(
+      { isActive: true, readBy: { $ne: req.user.id } },
+      { $addToSet: { readBy: req.user.id } },
+    );
+    res.json({ success: true, matched: r.matchedCount, modified: r.modifiedCount });
+  } catch (err) {
+    console.error('announcement.markAllRead error:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
