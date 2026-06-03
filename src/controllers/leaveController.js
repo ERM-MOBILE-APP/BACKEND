@@ -429,21 +429,51 @@ exports.adminUpdate = async (req, res) => {
     const fresh = await Leave.findByIdAndUpdate(req.params.id, update, { new: true })
       .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName');
 
-    // Fire notification on real status transition (approved or rejected).
+    // Fire notification on a REAL transition. Two independent paths:
+    //   1. HR final action  → status flipped to approved / rejected
+    //   2. Manager action   → managerStatus flipped to approved / rejected
+    // The earlier version only handled path 1, so a manager rejection on
+    // ERM Web never reached the employee's bell (issue from task #129/136).
     try {
-      if (status !== prev.status && (status === 'approved' || status === 'rejected')) {
-        const kind = fresh.requestType === 'permission' ? 'Permission' : 'Leave';
-        const when = fresh.requestType === 'permission'
-          ? `${fresh.date} (${fresh.startTime}–${fresh.endTime})`
-          : `${fresh.startDate}` +
-            (fresh.endDate && fresh.endDate !== fresh.startDate ? ` – ${fresh.endDate}` : '');
+      const kind = fresh.requestType === 'permission' ? 'Permission' : 'Leave';
+      const when = fresh.requestType === 'permission'
+        ? `${fresh.date} (${fresh.startTime}–${fresh.endTime})`
+        : `${fresh.startDate}` +
+          (fresh.endDate && fresh.endDate !== fresh.startDate ? ` – ${fresh.endDate}` : '');
+
+      // Path 1 — HR status changed to approved / rejected.
+      if (wantsStatus && status !== prev.status && (status === 'approved' || status === 'rejected')) {
         await notify(fresh.user, {
-          title: `${kind} ${status === 'approved' ? 'approved ✓' : 'rejected'}`,
+          title: `${kind} ${status} by HR`,
           body:  `Your ${kind.toLowerCase()} request for ${when} was ${status} by HR.` +
                  (hrComment ? ` Note: "${hrComment}"` : ''),
           type:  'leave',
           link:  '/(tabs)/leave',
         });
+        console.log(`[leave.adminUpdate] HR ${status} notif sent for leave ${fresh._id}`);
+      }
+
+      // Path 2 — manager flipped managerStatus to approved / rejected,
+      // and no HR status transition was sent in the same call.
+      const newMgr = String(update.managerStatus || '').toLowerCase();
+      const oldMgr = String(prev.managerStatus  || '').toLowerCase();
+      if (
+        wantsManagerStatus &&
+        newMgr !== oldMgr &&
+        (newMgr === 'approved' || newMgr === 'rejected') &&
+        !(wantsStatus && status !== prev.status)        // avoid duplicate notif when both flip
+      ) {
+        const actor = reviewedBy && /manager/i.test(reviewedBy)
+          ? `your manager (${reviewedBy})`
+          : 'your manager';
+        await notify(fresh.user, {
+          title: `${kind} ${newMgr} by Manager`,
+          body:  `Your ${kind.toLowerCase()} request for ${when} was ${newMgr} by ${actor}.` +
+                 (hrComment ? ` Note: "${hrComment}"` : ''),
+          type:  'leave',
+          link:  '/(tabs)/leave',
+        });
+        console.log(`[leave.adminUpdate] MGR ${newMgr} notif sent for leave ${fresh._id}`);
       }
     } catch (notifyErr) {
       console.error('[leave.adminUpdate] notify failed:', notifyErr.message);
