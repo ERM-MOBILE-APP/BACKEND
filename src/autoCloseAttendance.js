@@ -15,6 +15,15 @@
  * so the filter excludes it.
  */
 const Attendance = require('./models/Attendance');
+const Notification = require('./models/Notification');
+
+// dd-mm-yyyy formatter — same shape HRMS uses elsewhere.
+function fmtDate(iso) {
+  if (!iso) return '';
+  const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return String(iso);
+}
 
 const IST_OFFSET_MIN = 5 * 60 + 30;   // +05:30
 
@@ -57,7 +66,24 @@ async function sweepOnce() {
       row.status   = 'absent';
       row.autoClosed = true;
       row.autoClosedAt = new Date();
-      try { await row.save(); closed++; }
+      try {
+        await row.save();
+        closed++;
+        // Warn the employee the next time they open the app. HR rule:
+        // forgetting to check out = absent for the day, with an audit
+        // trail visible in the employee's notification bell.
+        try {
+          await Notification.create({
+            user: row.user,
+            title: 'You forgot to check out',
+            body:  `On ${fmtDate(row.date)} you didn't check out, so the system automatically checked you out at 12:00 AM and marked the day as Absent.`,
+            type:  'attendance',
+            link:  '/(tabs)/attendance',
+          });
+        } catch (notifyErr) {
+          console.warn('[autoCloseAttendance] notify failed:', notifyErr.message);
+        }
+      }
       catch (e) { console.warn('[autoCloseAttendance] save failed:', e.message); }
     }
     if (closed) console.log(`[autoCloseAttendance] closed ${closed} forgotten check-in(s)`);
