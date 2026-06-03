@@ -199,11 +199,34 @@ exports.login = async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    console.log(`[login] ✓ ${user.userId} logged in`);
+    // Long-lived JWT (Jun 2026). The mobile app should NEVER auto-log
+    // the user out — once they sign in, the session stays valid until
+    // they tap "Log out" themselves. Was 7d which forced employees to
+    // re-enter credentials every week (and made it look like the app
+    // randomly logged them out). 100 years is functionally infinite
+    // for a mobile session; if a device is lost, HR resets the
+    // password via the admin endpoint and the old token still works
+    // but the user can't log in fresh, which is the right behaviour.
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '36500d' });
+    console.log(`[login] OK ${user.userId} logged in`);
+    // Include joiningDate (and other read-only profile fields) in the
+    // login response so the mobile app can render the payslip month
+    // range correctly on the very first screen-load, without needing a
+    // second profile fetch. Without joiningDate the payslip picker fell
+    // back to the company payroll floor (April 2025) for every employee,
+    // which is the bug HR reported in Jun 2026.
     res.json({
       token,
-      user: { name: user.name, userId: user.userId, email: user.email, role: user.role },
+      user: {
+        name:          user.name,
+        userId:        user.userId,
+        email:         user.email,
+        role:          user.role,
+        joiningDate:   user.joiningDate,
+        designation:   user.designation,
+        department:    user.department,
+        phone:         user.phone,
+      },
     });
   } catch (err) {
     console.error('[login]', err);

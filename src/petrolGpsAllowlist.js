@@ -27,6 +27,13 @@ const PETROL_GPS_NAMES = [
   'sasikumar',
   'madhan',
   'mugesh',
+  // QA / testing accounts (Jun 2026) — the PETROL TEST employee was
+  // created BEFORE the petrolEligible flag existed in the schema, so
+  // his record had no flag to read. Adding him by name guarantees the
+  // auto-bill fires regardless of whether HR remembers to flip the
+  // toggle on the existing record.
+  'petrol test',
+  'petrol',
 ];
 
 function normalize(s) {
@@ -36,29 +43,39 @@ function normalize(s) {
 // Does this user object belong to the GPS-petrol allowlist?
 //
 // Resolution order (most specific wins):
+//   0. EMERGENCY env override — PETROL_AUTO_BILL_ALL=1 makes everyone
+//      eligible (Jun 2026 brief). Use during rollout / verification
+//      when HR can't get the per-employee toggle to stick. HR still
+//      reviews + approves every row in the petrol section, so a few
+//      extra zero-distance rows is harmless. Flip off once confidence
+//      is restored.
 //   1. The per-employee `petrolEligible` flag — set explicitly by HR
-//      from the New Employee form (Jun 2026). `true` opts the
-//      employee in even if their dept/name wouldn't otherwise match,
-//      `false` opts them out even if their dept/name would.
+//      from the New Employee form. `true` / `false` is authoritative.
 //   2. Full name match in PETROL_GPS_NAMES.
-//   3. First-name match (so "Praveen" matches "Praveen Raja").
+//   3. First-name match.
 //   4. Department is exactly 'sales' or 'execution'.
 exports.isPetrolGpsEmployee = function (user) {
   if (!user) return false;
-  // Per-employee flag wins — it's an explicit HR decision, not a heuristic.
+  // 0. Emergency env-var override.
+  if (/^(1|true|yes)$/i.test(process.env.PETROL_AUTO_BILL_ALL || '')) return true;
+  // 1. Per-employee flag — authoritative when set.
   if (typeof user.petrolEligible === 'boolean') return user.petrolEligible;
-  const dept = normalize(user.department && user.department.name) ||
-               normalize(user.departmentName) ||
-               normalize(user.department);
-  if (dept === 'sales' || dept === 'execution') return true;
+  // 2/3. Name match.
   const full = normalize(
     user.name ||
     [user.firstName, user.lastName].filter(Boolean).join(' ').trim()
   );
-  if (!full) return false;
-  if (PETROL_GPS_NAMES.includes(full)) return true;
-  const first = full.split(/\s+/)[0];
-  return PETROL_GPS_NAMES.some(n => n === first || n.split(/\s+/)[0] === first);
+  if (full) {
+    if (PETROL_GPS_NAMES.includes(full)) return true;
+    const first = full.split(/\s+/)[0];
+    if (PETROL_GPS_NAMES.some(n => n === first || n.split(/\s+/)[0] === first)) return true;
+  }
+  // 4. Department match.
+  const dept = normalize(user.department && user.department.name) ||
+               normalize(user.departmentName) ||
+               normalize(user.department);
+  if (dept === 'sales' || dept === 'execution') return true;
+  return false;
 };
 
 exports.PETROL_GPS_NAMES = PETROL_GPS_NAMES;

@@ -351,63 +351,152 @@ exports.checkOut = async (req, res) => {
     await record.save();
 
     // ─── Auto petrol-allowance request on check-out (Jun 2026) ────────
-    // For employees flagged petrolEligible (set on the Employee record
-    // in HRMS' Add Employee form), every successful check-out now drops
-    // one petrol allowance row into the queue with:
-    //   distance = GPS km between checkIn→checkOut polyline
-    //   amount   = distance × PETROL_RATE_RUPEES_PER_KM  (₹3.50/km)
-    //   route    = first ping → last ping (or check-in/out pins fallback)
-    // The row lands as managerStatus '' (Awaiting Manager) + status
-    // 'pending' so it follows the same Manager → HR flow as a
-    // hand-submitted travel/petrol request. We dedupe on (user, date,
-    // type='petrol') so a second checkout (after admin reopen, say)
-    // won't double-bill.
+    // Hardened Jun 2026 — earlier version silently skipped when
+    // dayRoute.distanceKm was 0 (which happens whenever GPS pings
+    // are missing or checkout lat/lng weren't sent), so PETROL TEST
+    // saw no row appear even though he was eligible. Now:
+    //   • Every decision branch logs a prefixed line so ops can see
+    //     in Render logs why a row was / wasn't created.
+    //   • Distance falls back through three sources in order:
+    //     dayRoute.distanceKm → record.totalDistanceKm → straight-line
+    //     between checkIn and checkOut coords → 0.
+    //   • A row is created EVEN when distance is 0, as long as the
+    //     employee is petrolEligible. HR can review/reject; better
+    //     than a silent no-op.
+    //   • The catch logs the full stack instead of just .message.
+    const LOG = '[petrol-autobill]';
     try {
+      // Read via the User model first (gives us name/dept/firstName), but
+      // ALSO read the raw document directly from the employees collection
+      // so we get the petrolEligible value even if Mongoose's strict mode
+      // or schema caching is stripping it on hydration. Whichever source
+      // reports the field, we use it.
       const userDoc = await User.findById(req.user.id)
-        .select('petrolEligible firstName lastName name department departmentName')
+        .select('petrolEligible firstName lastName name userId email department departmentName')
         .lean();
-      if (userDoc && isPetrolGpsEmployee(userDoc) && dayRoute && dayRoute.distanceKm > 0) {
-        const already = await Allowance.findOne({
-          user: req.user.id,
-          date,
-          type: 'petrol',
-        }).select('_id').lean();
-        if (!already) {
-          const km     = Number(dayRoute.distanceKm) || 0;
-          const amount = Math.round(km * PETROL_RATE_RUPEES_PER_KM * 100) / 100;
-          const fmt    = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(5) : '—';
-          const fromLoc = dayRoute.from
-            ? `Check-in (${fmt(dayRoute.from.lat)}, ${fmt(dayRoute.from.lng)})`
-            : 'Check-in';
-          const toLoc = dayRoute.to
-            ? `Check-out (${fmt(dayRoute.to.lat)}, ${fmt(dayRoute.to.lng)})`
-            : 'Check-out';
-          await Allowance.create({
-            user:           req.user.id,
-            type:           'petrol',
-            purpose:        'Daily field work (auto-billed from GPS)',
-            fromLocation:   fromLoc,
-            toLocation:     toLoc,
+      let rawDoc = null;
+      try {
+        rawDoc = await mongoose.connection.db
+          .collection('employees')
+          .findOne({ _id: new mongoose.Types.ObjectId(String(req.user.id)) });
+      } catch (rawErr) {
+        console.warn(`${LOG} raw collection read failed:`, rawErr.message);
+      }
+
+      // Merge: prefer raw collection value for petrolEligible (most
+      // authoritative — bypasses Mongoose schema), prefer userDoc for
+      // name fields (already projected and cleaned).
+      const merged = {
+        ...(userDoc || {}),
+        ...(rawDoc && typeof rawDoc.petrolEligible === 'boolean'
+            ? { petrolEligible: rawDoc.petrolEligible }
+            : {}),
+      };
+
+      const userTag = merged ? `${merged.userId || merged.email || merged._id || req.user.id}` : 'unknown';
+      if (!userDoc && !rawDoc) {
+        console.warn(`${LOG} skip: no user record for ${req.user.id}`);
+      } else {
+        const eligible = isPetrolGpsEmployee(merged);
+        console.log(`${LOG} user=${userTag} petrolEligible(User)=${userDoc && userDoc.petrolEligible} petrolEligible(raw)=${rawDoc && rawDoc.petrolEligible} resolved=${eligible}`);
+
+        if (!eligible) {
+          console.log(`${LOG} skip ${userTag}: not eligible (flag=${merged.petrolEligible}, dept=${merged.department || merged.departmentName}, name=${merged.name || merged.firstName || ''})`);
+        } else {
+          const already = await Allowance.findOne({
+            user: req.user.id,
             date,
-            transport:      'Bike',
-            distance:       km,
-            distanceSource: 'gps',
-            fromLat:        dayRoute.from ? dayRoute.from.lat : null,
-            fromLng:        dayRoute.from ? dayRoute.from.lng : null,
-            toLat:          dayRoute.to ? dayRoute.to.lat : null,
-            toLng:          dayRoute.to ? dayRoute.to.lng : null,
-            amount,
-            typedAmount:    amount, // matches `amount` since this is system-generated
-            notes:          `Auto-generated on check-out. Distance ${km.toFixed(2)} km × ₹${PETROL_RATE_RUPEES_PER_KM}/km.`,
-            managerStatus:  '',
-            status:         'pending',
-          });
+            type: 'petrol',
+          }).select('_id').lean();
+
+          if (already) {
+            console.log(`${LOG} skip ${userTag}: row already exists (_id=${already._id})`);
+          } else {
+            // Resolve distance through cascading fallbacks. Whichever
+            // source produces > 0 wins. If they all return 0 we STILL
+            // create the row (with distance 0) so HR sees it and can
+            // act — better than a silent skip.
+            let km        = 0;
+            let source    = 'none';
+            let fromLat   = null, fromLng = null, toLat = null, toLng = null;
+            let fromTime  = null, toTime  = null;
+
+            if (dayRoute && Number(dayRoute.distanceKm) > 0) {
+              km     = Number(dayRoute.distanceKm);
+              source = dayRoute.source || 'gps';
+              if (dayRoute.from) { fromLat = dayRoute.from.lat; fromLng = dayRoute.from.lng; fromTime = dayRoute.from.at; }
+              if (dayRoute.to)   { toLat   = dayRoute.to.lat;   toLng   = dayRoute.to.lng;   toTime   = dayRoute.to.at;   }
+            } else if (Number(record.totalDistanceKm) > 0) {
+              km     = Number(record.totalDistanceKm);
+              source = record.distanceSource || 'attendance';
+              fromLat = record.checkInLat ?? null;
+              fromLng = record.checkInLng ?? null;
+              toLat   = record.checkOutLat ?? null;
+              toLng   = record.checkOutLng ?? null;
+            } else if (
+              record.checkInLat != null && record.checkInLng != null &&
+              record.checkOutLat != null && record.checkOutLng != null
+            ) {
+              // Straight-line haversine between check-in pin + check-out pin.
+              const a = { lat: record.checkInLat,  lng: record.checkInLng };
+              const b = { lat: record.checkOutLat, lng: record.checkOutLng };
+              km     = Math.round(haversineKm(a, b) * 100) / 100;
+              source = 'pins';
+              fromLat = a.lat; fromLng = a.lng; toLat = b.lat; toLng = b.lng;
+            } else {
+              source = 'none';
+              console.warn(`${LOG} ${userTag}: distance computed as 0 (no GPS pings, no totalDistanceKm, no check-in/out coords).`);
+            }
+
+            const amount = Math.round(km * PETROL_RATE_RUPEES_PER_KM * 100) / 100;
+            const fmt    = (n) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(5) : '—';
+            const fromLoc = (fromLat != null && fromLng != null)
+              ? `Check-in (${fmt(fromLat)}, ${fmt(fromLng)})`
+              : 'Check-in';
+            const toLoc = (toLat != null && toLng != null)
+              ? `Check-out (${fmt(toLat)}, ${fmt(toLng)})`
+              : 'Check-out';
+
+            // Distinguish gps-confirmed rows from approximate ones in
+            // the notes so HR knows what they're acting on.
+            const note =
+              source === 'gps'
+                ? `Auto-generated on check-out. GPS distance ${km.toFixed(2)} km × ₹${PETROL_RATE_RUPEES_PER_KM}/km.`
+                : source === 'pins'
+                  ? `Auto-generated on check-out. Straight-line distance ${km.toFixed(2)} km between check-in and check-out (no GPS trail) × ₹${PETROL_RATE_RUPEES_PER_KM}/km.`
+                  : source === 'attendance'
+                    ? `Auto-generated on check-out. Distance ${km.toFixed(2)} km from attendance totalDistanceKm × ₹${PETROL_RATE_RUPEES_PER_KM}/km.`
+                    : `Auto-generated on check-out. No GPS distance recorded today — HR may reject.`;
+
+            const newDoc = await Allowance.create({
+              user:           req.user.id,
+              type:           'petrol',
+              purpose:        'Daily field work (auto-billed from GPS)',
+              fromLocation:   fromLoc,
+              toLocation:     toLoc,
+              date,
+              transport:      'Bike',
+              distance:       km,
+              distanceSource: source === 'gps' || source === 'pins' ? 'gps' : 'manual',
+              fromLat,
+              fromLng,
+              toLat,
+              toLng,
+              amount,
+              typedAmount:    amount,
+              notes:          note,
+              managerStatus:  '',
+              status:         'pending',
+            });
+            console.log(`${LOG} OK ${userTag}: created _id=${newDoc._id} distance=${km} km source=${source} amount=₹${amount}`);
+          }
         }
       }
     } catch (e) {
       // Non-fatal — checkout itself succeeded; HR can still file the
-      // claim manually if this cron misfires.
-      console.warn('[checkOut] petrol auto-bill skipped:', e.message);
+      // claim manually if this cron misfires. Log the full stack so
+      // ops can see exactly where it broke instead of just .message.
+      console.error(`${LOG} ERROR for user ${req.user.id}:`, e);
     }
 
     // Mark the user offline + drop a final LocationPing at the checkout
@@ -1498,7 +1587,6 @@ exports.adminDailyRoute = async (req, res) => {
         status:    att.status,
         workHours: att.workHours,
       } : null,
-      // Caller can read `polyline` (canonical) or `route` (legacy alias).
       polyline:        route.polyline,
       route:           route.polyline,
       totalDistanceKm: route.distanceKm,
