@@ -106,11 +106,16 @@ async function sweepOnce() {
     let skipped = 0;
 
     for (const date of dates) {
-      // Need at least checkIn — checkOut is preferred but we'll create
-      // even for an open checkin so the row exists by the time HR looks.
+      // Only fire after the employee has actually checked OUT for the
+      // day. Earlier the cron created rows on check-in too, which
+      // produced "Awaiting Manager" allowance rows for employees still
+      // mid-shift with a partial polyline. The petrol amount is meant
+      // to be the full workday's distance × Rs.3.50/km, so wait for
+      // checkOut before computing.
       const rows = await Attendance.find({
         date,
         checkIn:  { $ne: null },
+        checkOut: { $ne: null },
       }).lean();
 
       for (const record of rows) {
