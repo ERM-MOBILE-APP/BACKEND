@@ -199,15 +199,13 @@ exports.login = async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Long-lived JWT (Jun 2026). The mobile app should NEVER auto-log
-    // the user out — once they sign in, the session stays valid until
-    // they tap "Log out" themselves. Was 7d which forced employees to
-    // re-enter credentials every week (and made it look like the app
-    // randomly logged them out). 100 years is functionally infinite
-    // for a mobile session; if a device is lost, HR resets the
-    // password via the admin endpoint and the old token still works
-    // but the user can't log in fresh, which is the right behaviour.
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '36500d' });
+    // 10-day session (policy change, Jun 2026). After 10 days from
+    // login the JWT expires server-side: the protect middleware
+    // returns 401 / TokenExpiredError on the next request, the mobile
+    // client clears AsyncStorage and bounces the user to the login
+    // screen. Was previously 36500d (effectively never) so employees
+    // never had to re-auth; tightened to 10d at HR's request.
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '10d' });
     console.log(`[login] OK ${user.userId} logged in`);
     // Include joiningDate (and other read-only profile fields) in the
     // login response so the mobile app can render the payslip month

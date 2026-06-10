@@ -283,19 +283,22 @@ exports.checkOut = async (req, res) => {
     // ─── Early-checkout policy (Jun 2026 — wall-clock 5:30 PM IST) ────
     // HR's standard end-of-day is 5:30 PM IST. If the employee taps
     // Check Out BEFORE 5:30 PM IST, treat it as a short day:
-    //   • If HR has APPROVED a Permission for today → status stays
-    //     whatever the day was (present / late). The permission already
-    //     documents and justifies the early departure.
-    //   • If there is no permission OR the permission is still pending /
-    //     rejected → mark the row 'halfday' with earlyCheckoutLop=true.
-    //     The LOP rule (utils/leavePolicy) counts each halfday as 0.5 LOP
-    //     once the employee crosses the 2-per-month free quota.
+    //   • If the employee has applied for a Permission for today
+    //     (any status — pending / approved; rejected does NOT count) →
+    //     status becomes 'permission'. HR is the final arbiter via the
+    //     permission record; the attendance row just reflects that an
+    //     early departure was filed with a reason.
+    //   • If there is no permission filed at all → mark the row
+    //     'halfday' with earlyCheckoutLop=true. The LOP rule
+    //     (utils/leavePolicy) counts each halfday as 0.5 LOP once the
+    //     employee crosses the 2-per-month free quota.
     //
-    // Only an APPROVED permission excuses the early checkout. A pending
-    // request that HR may later reject MUST NOT pre-emptively excuse the
-    // employee — otherwise an employee could create a fake permission
-    // request at 4 PM, leave at 4:30 PM, and dodge LOP even if HR rejects
-    // it the next morning.
+    // Policy refinement (Jun 2026 HR request): the old rule required
+    // APPROVED permission — but employees said it was unfair to be
+    // pre-marked halfday LOP when HR hadn't acted on their request yet,
+    // and HR confirmed they prefer the new rule (any non-rejected
+    // permission excuses the early checkout, and if HR rejects later
+    // they'll manually mark the day halfday).
     const istParts2 = new Intl.DateTimeFormat('en-GB', {
       timeZone: 'Asia/Kolkata',
       hour:   '2-digit',
@@ -307,23 +310,25 @@ exports.checkOut = async (req, res) => {
     const isEarlyCheckout = coHour < 17 || (coHour === 17 && coMinute < 30);
 
     if (isEarlyCheckout) {
-      let hadApprovedPermission = false;
+      let hasPermissionRequest = false;
       try {
         const perm = await Leave.findOne({
           user: req.user.id,
           requestType: 'permission',
           date,
-          status: 'approved',     // ONLY HR-approved permission excuses it
+          status: { $in: ['pending', 'approved'] }, // any non-rejected request
         }).lean();
-        hadApprovedPermission = !!perm;
+        hasPermissionRequest = !!perm;
       } catch { /* fall through and treat as no permission */ }
 
-      if (!hadApprovedPermission) {
+      if (hasPermissionRequest) {
+        // Permission filed (any non-rejected state) — show as Permission.
+        record.status = 'permission';
+        record.earlyCheckoutLop = false;
+      } else {
+        // No permission filed at all → half-day LOP.
         record.status = 'halfday';
         record.earlyCheckoutLop = true;
-      } else {
-        // Approved permission on file — early checkout is excused.
-        record.earlyCheckoutLop = false;
       }
     } else {
       // Checked out at or after 5:30 PM — definitely not an early-out.
@@ -972,31 +977,55 @@ function parseAnyDate(s) {
  */
 exports.locationPing = async (req, res) => {
   try {
-    const { lat, lng, accuracy, speed } = req.body || {};
+    const { lat, lng, accuracy, speed, recordedAt } = req.body || {};
     if (typeof lat !== 'number' || typeof lng !== 'number' || !isFinite(lat) || !isFinite(lng)) {
       return res.status(400).json({ message: 'Provide numeric lat and lng.' });
     }
-    const now  = new Date();
+
+    // Accuracy gate (Jun 2026 — map accuracy fix).
+    // Reject pings whose reported accuracy radius is wider than 250 m.
+    const accNum = typeof accuracy === 'number' ? accuracy : null;
+    const acceptableAccuracy = accNum == null || accNum <= 250;
+
+    // Replay support (Jun 2026 — offline queue).
+    // The mobile app can post `recordedAt` (ISO string) when replaying
+    // a sample collected during a network outage. We trust it within a
+    // reasonable window (last 6 hours; older replays are treated as
+    // arriving now so a clock-skew bug can't backfill yesterday's row).
+    const nowDate = new Date();
+    let stampedAt = nowDate;
+    if (typeof recordedAt === 'string') {
+      const r = new Date(recordedAt);
+      if (!isNaN(r.getTime()) && (nowDate.getTime() - r.getTime()) <= 6 * 60 * 60 * 1000 && r.getTime() <= nowDate.getTime() + 60_000) {
+        stampedAt = r;
+      }
+    }
+    const now  = stampedAt;
     const date = todayISO();
 
-    // 1) Update the user's live presence + location.
+    // 1) Update the user's live presence + location (even for low-acc
+    //    pings — see comment above).
     await User.findByIdAndUpdate(req.user.id, {
       presence: 'active',
       lastSeenAt: now,
       lastLocation: {
         lat, lng,
-        accuracy: typeof accuracy === 'number' ? accuracy : null,
+        accuracy: accNum,
         updatedAt: now,
       },
     });
 
-    // 2) Append the audit ping (lightweight insert, ~80 bytes per row).
+    // 2) Append the audit ping — but ONLY if accuracy passed the gate.
+    //    Sub-quality samples don't go into the polyline.
+    if (!acceptableAccuracy) {
+      return res.json({ ok: true, accepted: false, reason: 'accuracy>250m' });
+    }
     await LocationPing.create({
       user: req.user.id,
       date,
       recordedAt: now,
       lat, lng,
-      accuracy: typeof accuracy === 'number' ? accuracy : null,
+      accuracy: accNum,
       speed:    typeof speed    === 'number' ? speed    : null,
       presence: 'active',
     });
@@ -1320,46 +1349,89 @@ exports.adminLiveLocations = async (req, res) => {
       let status = 'offline';
       let site   = 'Last known location';
       if (lat != null && lng != null) {
+        // PRESENCE-FIRST RULE (Jun 2026 HR policy):
+        // The mobile app calls setPresence('offline') the moment device
+        // location is detected as off. We honour that immediately — no
+        // grace window — so HRMS flips the row to "Offline" on the very
+        // next 45 sec poll. If we waited for the ping to age past the
+        // 25-min stale window, HR would still see the employee as
+        // active for up to 25 min after they'd turned location off.
+        if (u.presence === 'offline') {
+          status = 'offline';
+          site   = 'Location off';
+          // Resolve labels + return early before any geofence/freshness logic
+          const [deptLabel0, roleLabel0] = await Promise.all([
+            resolveLabel(u.department,  'dept'),
+            resolveLabel(u.designation, 'desig'),
+          ]);
+          const fullName0 = u.name || ((u.firstName || '') + ' ' + (u.lastName || '')).trim() || 'Unknown';
+          return {
+            _id:        u._id,
+            name:       fullName0,
+            employeeId: u.employeeId || '',
+            email:      u.email || '',
+            role:       roleLabel0,
+            dept:       deptLabel0,
+            lat, lng, speed, accuracy,
+            status, site,
+            lastSeen:   recordedAt,
+            route:      null,
+          };
+        }
+
         const ageMin = recordedAt ? (Date.now() - new Date(recordedAt).getTime()) / 60000 : 999;
-        // 25 min stale window. The mobile app now runs THREE redundant
-        // recovery layers:
-        //   • 30-sec foreground GPS watcher        (catches GPS toggles)
-        //   • 60-sec bg-task guardian              (catches OEM kills)
-        //   • OS-scheduled 2-min background pings  (the workhorse)
-        // 25 min = one full guardian-cycle of grace on top of the
-        // theoretical worst case (12 min OEM throttle + 2 min interval +
-        // network round-trip). If we hit it the task has genuinely been
-        // dead long enough that "Offline" is the honest label.
-        const stale  = ageMin > 25;
+        // 10 min stale window (tightened from 25 min in Jun 2026 at HR's
+        // request). The mobile app runs four redundant recovery layers:
+        //   • 30-sec foreground GPS watcher       (catches GPS toggles)
+        //   • 30-sec bg-task guardian             (catches OEM kills)
+        //   • OS-scheduled 90-sec background pings (the workhorse)
+        //   • No self-stop on 401 — task stays armed across token blips
+        // 10 min ≈ 6 missed pings, still enough to bridge a normal OEM
+        // Doze cycle but tight enough that HR sees a real-time picture.
+        const stale = ageMin > 10;
 
         if (!stale) {
           // ── FRESH PING WINS ────────────────────────────────────────
-          // A ping less than 12 min old is the strongest evidence that
-          // GPS is currently on, so we ignore any stale `presence='idle'`
-          // left over from a previous session. Decide between office and
-          // travelling purely from the geo / speed sample.
+          // A ping less than 10 min old is strong evidence that GPS is
+          // currently on. Decide between office and travelling from the
+          // geo + speed sample.
           const d = distMeters(lat, lng, OFFICE_LAT, OFFICE_LNG);
           if (d <= OFFICE_RADIUS_M) {
             status = 'office';
             site   = 'Tesco Structures HQ';
           } else {
-            // Outside office geofence. If we have a real speed sample
-            // assume travelling; otherwise still flag travelling rather
-            // than the ambiguous "Field" / "active" we used to emit.
             status = 'travelling';
             site   = 'On the move';
           }
-        } else if (u.presence === 'idle') {
-          // Stale ping + presence flagged idle = GPS turned off mid-shift.
-          status = 'idle';
-          site   = 'Location off';
-        } else if (u.presence === 'offline') {
-          status = 'offline';
-          site   = 'Last known location';
         } else {
-          // Stale ping with no useful presence value → GPS probably off.
-          status = 'idle';
-          site   = 'Location off';
+          // STALE / NO RECENT PING.
+          //
+          // We don't actually KNOW what's happening on the phone unless
+          // the mobile app explicitly told us via setPresence('offline').
+          // Pings can stop for many reasons even with GPS on:
+          //   • OEM battery saver killed the foreground service
+          //   • Network died for >10 min
+          //   • User force-stopped the app from Recent Apps
+          //   • Phone rebooted and the user hasn't opened the app yet
+          //
+          // The old code labelled all of these as "Location off", which
+          // was a lie when the user's GPS was actually on — HR would
+          // hassle the employee about turning location on when in fact
+          // they had. Fix: only say "Location off" when the mobile app
+          // EXPLICITLY reported it. Otherwise just say "Offline (no
+          // recent location)" — honest about our uncertainty.
+          if (u.presence === 'offline') {
+            // User physically turned off device location (handleGpsOffWarn
+            // in the mobile app called setPresence('offline')). This is
+            // the ONLY signal that lets us assert "Location off".
+            status = 'offline';
+            site   = 'Location off';
+          } else {
+            // No explicit offline signal, just no fresh pings. We don't
+            // know whether GPS is on or off — surface that honestly.
+            status = 'offline';
+            site   = 'No recent location';
+          }
         }
       }
 
