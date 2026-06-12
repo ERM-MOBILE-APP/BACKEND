@@ -977,15 +977,23 @@ function parseAnyDate(s) {
  */
 exports.locationPing = async (req, res) => {
   try {
-    const { lat, lng, accuracy, speed, recordedAt } = req.body || {};
+    const { lat, lng, accuracy, speed, recordedAt, isStationary } = req.body || {};
     if (typeof lat !== 'number' || typeof lng !== 'number' || !isFinite(lat) || !isFinite(lng)) {
       return res.status(400).json({ message: 'Provide numeric lat and lng.' });
     }
 
-    // Accuracy gate (Jun 2026 — map accuracy fix).
-    // Reject pings whose reported accuracy radius is wider than 250 m.
+    // Accuracy gate (tightened Jun 2026 — anti-jitter).
+    // Mobile-side filter already rejects > 30m, so anything wider here
+    // is suspect. Accept up to 50m as a safety margin (cached fallback
+    // positions sometimes have a slightly looser radius). Anything
+    // wider gets the live presence updated but NOT polylined.
     const accNum = typeof accuracy === 'number' ? accuracy : null;
-    const acceptableAccuracy = accNum == null || accNum <= 250;
+    const acceptableAccuracy = accNum == null || accNum <= 50;
+    // isStationary flag from the mobile anti-jitter filter. When true,
+    // the mobile sent the held anchor (not a fresh GPS reading) so the
+    // polyline shouldn't be extended with what is effectively the same
+    // point we already have.
+    const stationary = isStationary === true;
 
     // Replay support (Jun 2026 — offline queue).
     // The mobile app can post `recordedAt` (ISO string) when replaying
@@ -1004,7 +1012,9 @@ exports.locationPing = async (req, res) => {
     const date = todayISO();
 
     // 1) Update the user's live presence + location (even for low-acc
-    //    pings — see comment above).
+    //    pings — see comment above). The `stationary` flag is mirrored
+    //    onto the user doc so HRMS Live Tracking can show a clear
+    //    Moving / Stationary badge per employee.
     await User.findByIdAndUpdate(req.user.id, {
       presence: 'active',
       lastSeenAt: now,
@@ -1012,13 +1022,21 @@ exports.locationPing = async (req, res) => {
         lat, lng,
         accuracy: accNum,
         updatedAt: now,
+        stationary,
       },
     });
 
-    // 2) Append the audit ping — but ONLY if accuracy passed the gate.
-    //    Sub-quality samples don't go into the polyline.
+    // 2) Append the audit ping — gated on accuracy AND on movement.
+    //    - Sub-quality samples (>50 m) never enter the polyline.
+    //    - Stationary samples (anchor echoes) update presence + the
+    //      "last seen" position on the user, but don't pollute the
+    //      polyline. This is what makes the marker stop drifting on
+    //      HR's map when an employee is standing still.
     if (!acceptableAccuracy) {
-      return res.json({ ok: true, accepted: false, reason: 'accuracy>250m' });
+      return res.json({ ok: true, accepted: false, reason: 'accuracy>50m' });
+    }
+    if (stationary) {
+      return res.json({ ok: true, accepted: true, stationary: true });
     }
     await LocationPing.create({
       user: req.user.id,
@@ -1030,7 +1048,7 @@ exports.locationPing = async (req, res) => {
       presence: 'active',
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, stationary: false });
   } catch (err) {
     console.error('locationPing error:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -1458,6 +1476,12 @@ exports.adminLiveLocations = async (req, res) => {
       }
 
       const fullName = u.name || ((u.firstName || "") + " " + (u.lastName || "")).trim() || "Unknown";
+      // Movement derived from the latest anti-jitter signal. Mobile sets
+      // stationary=true when the held anchor is what just got sent
+      // (employee hasn't moved >20 m or 0.5 m/s).
+      const movement = (status === 'offline' || status == null)
+        ? null
+        : (u.lastLocation && u.lastLocation.stationary ? 'stationary' : 'moving');
       return {
         _id:        String(u._id),
         name:       fullName,
@@ -1468,6 +1492,7 @@ exports.adminLiveLocations = async (req, res) => {
         lat, lng, speed, accuracy,
         site,
         status,
+        movement,
         route,
         checkInAt:  att.checkIn,
         lastSeen:   recordedAt,
