@@ -59,8 +59,16 @@ app.use((req, res, next) => {
 app.use(compression({ threshold: 1024 }));
 app.use(express.json());
 
+const { bootstrapOfficeAnchor } = require('./bootstrapOfficeAnchor');
+
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB connected'))
+  .then(async () => {
+    console.log('MongoDB connected');
+    // One-shot office anchor lock. Only fires if BOOTSTRAP_OFFICE_EMPLOYEE_ID
+    // is set AND no anchor is locked yet. Safe to leave the env var in
+    // place — subsequent restarts no-op once the anchor exists.
+    await bootstrapOfficeAnchor();
+  })
   .catch(err => console.error('MongoDB error:', err));
 
 app.use('/api/auth', require('./routes/auth'));
