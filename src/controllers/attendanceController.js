@@ -1301,9 +1301,34 @@ exports.adminLiveLocations = async (req, res) => {
   if (!expected) return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
   if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
 
-  const OFFICE_LAT      = parseFloat(process.env.OFFICE_LAT      || '13.0412');
-  const OFFICE_LNG      = parseFloat(process.env.OFFICE_LNG      || '80.2127');
-  const OFFICE_RADIUS_M = parseFloat(process.env.OFFICE_RADIUS_M || '200');
+  // ── Office anchor resolution (#281 — Jun 2026) ────────────────────
+  // Priority order:
+  //   1. SystemConfig.officeAnchor in MongoDB (HR manually pinned it).
+  //   2. OFFICE_LAT / OFFICE_LNG env vars.
+  //   3. Code defaults.
+  //
+  // The DB-locked value WINS so we don't accidentally drift back to
+  // the env default after a deploy. It also never auto-recalculates —
+  // it only changes when HR explicitly POSTs to /admin/lock-office.
+  let OFFICE_LAT      = parseFloat(process.env.OFFICE_LAT      || '13.0412');
+  let OFFICE_LNG      = parseFloat(process.env.OFFICE_LNG      || '80.2127');
+  let OFFICE_RADIUS_M = parseFloat(process.env.OFFICE_RADIUS_M || '60');
+  let OFFICE_NAME     = 'Tesco Structures HQ';
+  try {
+    const SystemConfig = require('../models/SystemConfig');
+    if (SystemConfig) {
+      const cfg = await SystemConfig.findOne({}).lean();
+      const anchor = cfg && cfg.officeAnchor;
+      if (anchor && typeof anchor.lat === 'number' && typeof anchor.lng === 'number') {
+        OFFICE_LAT      = anchor.lat;
+        OFFICE_LNG      = anchor.lng;
+        OFFICE_RADIUS_M = typeof anchor.radiusM === 'number' ? anchor.radiusM : OFFICE_RADIUS_M;
+        OFFICE_NAME     = anchor.name || OFFICE_NAME;
+      }
+    }
+  } catch (e) {
+    console.warn('[adminLiveLocations] SystemConfig read failed — using env vars:', e?.message);
+  }
 
   const distMeters = (lat1, lng1, lat2, lng2) => {
     const R = 6371000;
@@ -1501,7 +1526,7 @@ exports.adminLiveLocations = async (req, res) => {
 
     res.json({
       success: true,
-      office:  { lat: OFFICE_LAT, lng: OFFICE_LNG, radiusM: OFFICE_RADIUS_M, name: "Tesco Structures HQ" },
+      office:  { lat: OFFICE_LAT, lng: OFFICE_LNG, radiusM: OFFICE_RADIUS_M, name: OFFICE_NAME },
       data:    out.filter(Boolean),
       generatedAt: new Date().toISOString(),
     });
@@ -1636,77 +1661,173 @@ exports.adminDailyRoute = async (req, res) => {
     let user;
     if (empIdRaw) {
       user = await User.findOne({ employeeId: empIdRaw })
-        .select('firstName lastName name employeeId email designation department designationTitle departmentName')
+        .select('firstName lastName name employeeId email designation department')
         .lean();
-    } else if (userId) {
+    }
+    if (!user && userId && /^[a-f0-9]{24}$/i.test(userId)) {
       user = await User.findById(userId)
-        .select('firstName lastName name employeeId email designation department designationTitle departmentName')
+        .select('firstName lastName name employeeId email designation department')
         .lean();
     }
     if (!user) {
-      return res.status(404).json({ message: 'Employee not found.' });
+      return res.status(404).json({ message: 'Employee not found' });
     }
 
-    // Anchor the route window to the day's check-in / check-out span so
-    // pings before/after the shift don't inflate distance.
-    const att = await Attendance.findOne({ user: user._id, date }).lean();
-    const route = await buildDailyRoute(user._id, date, {
-      checkIn:    att?.checkIn,
-      checkOut:   att?.checkOut,
-      checkInLat: att?.checkInLat,
-      checkInLng: att?.checkInLng,
-      checkOutLat: att?.checkOutLat,
-      checkOutLng: att?.checkOutLng,
-    });
+    // Pull every ping for the day, ordered chronologically. We trust the
+    // anti-jitter filter on the mobile side to have suppressed stationary
+    // points — every row here represents real motion.
+    const pings = await LocationPing.find({ user: user._id, date })
+      .sort({ recordedAt: 1 })
+      .select('lat lng recordedAt accuracy speed')
+      .lean();
 
-    // Allowance overlay — if this employee filed a travel/petrol claim
-    // on the date, surface the from/to pins so the map can render F + T
-    // markers alongside the GPS polyline.
-    const allow = await Allowance.findOne({ user: user._id, date }).lean();
-    const allowanceShape = allow ? {
-      fromLocation: allow.fromLocation,
-      toLocation:   allow.toLocation,
-      fromLat:      allow.fromLat,
-      fromLng:      allow.fromLng,
-      toLat:        allow.toLat,
-      toLng:        allow.toLng,
-      distance:     allow.distance,
-      distanceSource: allow.distanceSource,
-      status:       allow.status,
-    } : null;
+    // Total km via Haversine along consecutive points. Matches the
+    // formula used by the petrol auto-bill so the two stay in sync.
+    const distMeters = (a, b) => {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(b.lat - a.lat);
+      const dLng = toRad(b.lng - a.lng);
+      const s = Math.sin(dLat / 2) ** 2 +
+                Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(s));
+    };
+    let totalM = 0;
+    for (let i = 1; i < pings.length; i++) {
+      totalM += distMeters(pings[i - 1], pings[i]);
+    }
+    const route = pings.map(p => ({ lat: p.lat, lng: p.lng, t: p.recordedAt }));
+    const fullName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim() || 'Unknown';
 
-    const fullName =
-      user.name ||
-      ((user.firstName || '') + ' ' + (user.lastName || '')).trim() ||
-      'Unknown';
-
-    res.json({
+    return res.json({
       success: true,
       employee: {
-        _id:        String(user._id),
+        _id: String(user._id),
+        name: fullName,
         employeeId: user.employeeId || '',
-        name:       fullName,
-        email:      user.email || '',
-        designation: user.designationTitle || user.designation || '',
-        department:  user.departmentName  || user.department  || '',
+        email: user.email || '',
       },
-      attendance: att ? {
-        date:      att.date,
-        checkIn:   att.checkIn,
-        checkOut:  att.checkOut,
-        status:    att.status,
-        workHours: att.workHours,
-      } : null,
-      polyline:        route.polyline,
-      route:           route.polyline,
-      totalDistanceKm: route.distanceKm,
-      distanceSource:  route.source,
-      from:            route.from,
-      to:              route.to,
-      allowance:       allowanceShape,
+      date,
+      route,
+      totalKm: Number((totalM / 1000).toFixed(2)),
     });
   } catch (err) {
-    console.error('[attendance.adminDailyRoute]', err);
-    res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('adminDailyRoute error:', err);
+    return res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * POST /api/attendance/admin/lock-office     (x-admin-secret)
+ *
+ * Permanently anchor the office to a specific employee's current GPS
+ * location. Reads `User.lastLocation` for the employee and writes it
+ * to the SystemConfig singleton. From the next live-tracking poll
+ * onwards, `adminLiveLocations` returns these coords as the office
+ * centre — surviving deploys, dyno restarts, and env-var changes.
+ *
+ * Does NOT auto-recalculate. The anchor stays exactly where this call
+ * pinned it until HR explicitly calls this endpoint again with a
+ * different employee, or DELETE /admin/lock-office is invoked.
+ *
+ * Body:  { employeeId: "TES047" }   // or { lat, lng } for direct override
+ * Reply: { success, officeAnchor }
+ */
+exports.lockOfficeAnchor = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  const SystemConfig = require('../models/SystemConfig');
+  if (!SystemConfig) {
+    return res.status(503).json({ message: 'SystemConfig model not loaded.' });
+  }
+
+  try {
+    const body = req.body || {};
+    const empIdRaw = String(body.employeeId || '').trim().toUpperCase();
+
+    // Resolution paths:
+    //   (a) employeeId  → read User.lastLocation for that person.
+    //   (b) lat + lng   → trust the explicit coords (manual override).
+    let anchor = null;
+    let sourceMethod = null;
+    let sourceEmpId = null;
+    let sourceEmpName = null;
+
+    if (empIdRaw) {
+      const user = await User.findOne({ employeeId: empIdRaw })
+        .select('firstName lastName name employeeId lastLocation')
+        .lean();
+      if (!user) {
+        return res.status(404).json({ message: `Employee ${empIdRaw} not found.` });
+      }
+      const loc = user.lastLocation || {};
+      if (typeof loc.lat !== 'number' || typeof loc.lng !== 'number') {
+        return res.status(409).json({
+          message: `Employee ${empIdRaw} has no current GPS location on record. Ask them to open the ERM app while at the office, then retry.`,
+        });
+      }
+      anchor = { lat: loc.lat, lng: loc.lng };
+      sourceMethod = 'employee-gps';
+      sourceEmpId   = user.employeeId;
+      sourceEmpName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim();
+    } else if (typeof body.lat === 'number' && typeof body.lng === 'number' && isFinite(body.lat) && isFinite(body.lng)) {
+      anchor = { lat: body.lat, lng: body.lng };
+      sourceMethod = 'manual';
+    } else {
+      return res.status(400).json({
+        message: "Provide either employeeId (uses their last GPS) or explicit lat/lng (direct).",
+      });
+    }
+
+    const name    = typeof body.name    === "string" ? body.name.trim()    : "Tesco Structures HQ";
+    const radiusM = typeof body.radiusM === "number" ? body.radiusM        : 60;
+
+    const updated = await SystemConfig.findOneAndUpdate(
+      {},
+      {
+        $set: {
+          officeAnchor: {
+            lat: anchor.lat,
+            lng: anchor.lng,
+            name,
+            radiusM,
+            lockedAt: new Date(),
+            source: {
+              employeeId:   sourceEmpId,
+              employeeName: sourceEmpName,
+              method:       sourceMethod,
+            },
+          },
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean();
+
+    console.log("[lockOfficeAnchor] anchor pinned at", anchor.lat, anchor.lng, "source:", sourceMethod, sourceEmpId || "");
+    return res.json({ success: true, officeAnchor: updated.officeAnchor });
+  } catch (err) {
+    console.error("lockOfficeAnchor error:", err);
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// GET /api/attendance/admin/lock-office (x-admin-secret)
+// Reads the currently-locked office anchor for inspection in HRMS.
+exports.getLockedOfficeAnchor = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || "").trim();
+  const got      = (req.headers["x-admin-secret"] || "").trim();
+  if (!expected)        return res.status(503).json({ message: "ADMIN_SECRET not configured." });
+  if (got !== expected) return res.status(401).json({ message: "Missing/invalid x-admin-secret." });
+
+  const SystemConfig = require("../models/SystemConfig");
+  if (!SystemConfig) return res.json({ officeAnchor: null });
+  try {
+    const cfg = await SystemConfig.findOne({}).lean();
+    res.json({ officeAnchor: cfg && cfg.officeAnchor ? cfg.officeAnchor : null });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 };

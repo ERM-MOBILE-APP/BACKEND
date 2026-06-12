@@ -22,6 +22,8 @@ const {
   adminDailyRoutesList,
   adminListRequests,
   adminUpdateRequest,
+  lockOfficeAnchor,
+  getLockedOfficeAnchor,
 } = require('../controllers/attendanceController');
 
 router.post ('/checkin',       auth, checkIn);
@@ -50,6 +52,12 @@ router.get  ('/admin/all',             adminListAll);
 router.get  ('/admin/requests',         adminListRequests);
 router.patch('/admin/requests/:id',     adminUpdateRequest);
 router.get  ('/admin/live-locations',  adminLiveLocations);
+
+// Office anchor lock (#281). POST locks the anchor to an employee's
+// current GPS (or to explicit lat/lng); GET reads the currently
+// locked anchor for inspection in HRMS.
+router.post ('/admin/lock-office',     lockOfficeAnchor);
+router.get  ('/admin/lock-office',     getLockedOfficeAnchor);
 
 // Daily route map + km for one employee on one date — the petrol section
 // in HRMS calls this to show the path the employee actually travelled
