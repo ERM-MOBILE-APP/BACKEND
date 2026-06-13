@@ -1602,23 +1602,37 @@ exports.adminDailyRoutesList = async (req, res) => {
     const allowances = await Allowance.find({ date }).lean();
     const allowByUser = new Map(allowances.map((a) => [String(a.user), a]));
 
-    const items = [];
-    for (const a of att) {
-      const route = await buildDailyRoute(a.user?._id || a.user, date, {
-        checkIn:    a.checkIn,
-        checkOut:   a.checkOut,
-        checkInLat: a.checkInLat,
-        checkInLng: a.checkInLng,
-        checkOutLat: a.checkOutLat,
-        checkOutLng: a.checkOutLng,
-      });
+    // Parallelize buildDailyRoute across employees (#284 prod fix).
+    // Was a sequential for-of loop — with 50 employees @ 200ms each
+    // (polyline simplification + Mongo round-trip), the response took
+    // 10+ seconds, frequently exceeding Render's edge timeout. Now
+    // Promise.all runs them concurrently; total time is roughly the
+    // slowest single row, not the sum. Mongoose connection pool
+    // handles the concurrent queries fine.
+    const items = await Promise.all(att.map(async (a) => {
+      let route;
+      try {
+        route = await buildDailyRoute(a.user?._id || a.user, date, {
+          checkIn:    a.checkIn,
+          checkOut:   a.checkOut,
+          checkInLat: a.checkInLat,
+          checkInLng: a.checkInLng,
+          checkOutLat: a.checkOutLat,
+          checkOutLng: a.checkOutLng,
+        });
+      } catch (err) {
+        // One employee's polyline computation failing must not take
+        // down the whole list — return a zero row and keep going.
+        console.warn('[adminDailyRoutesList] buildDailyRoute failed for', a.user, err.message);
+        route = { distanceKm: 0, source: 'error' };
+      }
       const u = a.user || {};
       const fullName =
         u.name ||
         ((u.firstName || '') + ' ' + (u.lastName || '')).trim() ||
         '—';
       const allow = allowByUser.get(String(u._id || a.user));
-      items.push({
+      return {
         _id:         String(u._id || a.user),
         employeeId:  u.employeeId || '',
         name:        fullName,
@@ -1633,8 +1647,8 @@ exports.adminDailyRoutesList = async (req, res) => {
         source:      route.source,
         hasAllowance: !!allow,
         allowanceStatus: allow ? allow.status : '',
-      });
-    }
+      };
+    }));
     res.json({ count: items.length, items });
   } catch (err) {
     console.error('[attendance.adminDailyRoutesList]', err);
@@ -1709,7 +1723,13 @@ exports.adminDailyRoute = async (req, res) => {
       },
       date,
       route,
-      totalKm: Number((totalM / 1000).toFixed(2)),
+      // Frontend looks for several field names from older versions of
+      // this endpoint; emit ALL of them so the existing HRMS bundle and
+      // RouteMapModal both render without a redeploy.
+      polyline: route,
+      points:   route,
+      totalKm:         Number((totalM / 1000).toFixed(2)),
+      totalDistanceKm: Number((totalM / 1000).toFixed(2)),
     });
   } catch (err) {
     console.error('adminDailyRoute error:', err);
@@ -1806,7 +1826,7 @@ exports.lockOfficeAnchor = async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).lean();
 
-    console.log("[lockOfficeAnchor] anchor pinned at", anchor.lat, anchor.lng, "source:", sourceMethod, sourceEmpId || "");
+    console.log("[lockOfficeAnchor] anchor pinned", anchor.lat, anchor.lng);
     return res.json({ success: true, officeAnchor: updated.officeAnchor });
   } catch (err) {
     console.error("lockOfficeAnchor error:", err);
@@ -1815,7 +1835,6 @@ exports.lockOfficeAnchor = async (req, res) => {
 };
 
 // GET /api/attendance/admin/lock-office (x-admin-secret)
-// Reads the currently-locked office anchor for inspection in HRMS.
 exports.getLockedOfficeAnchor = async (req, res) => {
   const expected = (process.env.ADMIN_SECRET || "").trim();
   const got      = (req.headers["x-admin-secret"] || "").trim();

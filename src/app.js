@@ -111,23 +111,46 @@ app.get('/api/health', (req, res) =>
   res.json({ ok: true, time: new Date(), uptime: process.uptime() })
 );
 
-app.use((err, req, res, next) => {
+// Uptime status endpoint. Returns mongoose connection state, process
+// uptime, memory usage, and whether keep-alive is pointed at an
+// external URL. Hit this from an external watchdog (cron-job.org,
+// UptimeRobot) to verify the dyno is healthy AND that the crons are
+// actually configured to run.
+app.get('/api/_uptime', function (req, res) {
+  var mongoose = require('mongoose');
+  var states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  var mongoState = states[mongoose.connection.readyState] || 'unknown';
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+    mongoose: mongoState,
+    keepAliveExternal: !!(process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL),
+    memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    crons: {
+      autoCloseAttendance: 'every 10 min',
+      autoPetrolBilling:   'every 5 min',
+      keepAlive:           'every 10 min',
+    },
+  });
+});
+
+app.use(function (err, req, res, next) {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Server error', error: err.message });
 });
 
-const PORT = process.env.PORT || 5000;
+var PORT = process.env.PORT || 5000;
 // Health probe used by keepAlive.js self-pinger.
-app.get('/api/_health', (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get('/api/_health', function (req, res) { res.json({ ok: true, ts: new Date().toISOString() }); });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(PORT, function () {
+  console.log('Server running on port ' + PORT);
   // Kick off the keep-alive cron once the server is up
   startKeepAlive(PORT);
   // Sweep open check-ins at IST midnight - mark as absent.
   startAutoCloseAttendance();
   // Auto-bill petrol for eligible employees every 5 min - no manual
-  // backfill needed. Picks up anyone whose checkout's inline auto-bill
-  // misfired and creates the row automatically.
+  // backfill needed.
   startAutoPetrolBilling();
 });

@@ -102,10 +102,16 @@ function startAutoCloseAttendance() {
   if (!process.env.MONGO_URI && process.env.NODE_ENV !== 'production') {
     return;
   }
-  console.log('[autoCloseAttendance] scheduled — runs every 10 min');
-  // Run once 15s after boot so we don't compete with seed/migrations.
-  setTimeout(sweepOnce, 15_000);
-  setInterval(sweepOnce, 10 * 60 * 1000);
+  console.log('[autoCloseAttendance] ✓ scheduled — every 10 min');
+  // Wrap each tick so a single thrown error never kills the cron loop.
+  // setInterval inherits the previous error if the callback rejects; in
+  // older Node this could break the timer entirely.
+  const safeSweep = async () => {
+    try { await sweepOnce(); }
+    catch (e) { console.warn('[autoCloseAttendance] tick crashed:', e && e.message); }
+  };
+  setTimeout(safeSweep, 15_000);
+  setInterval(safeSweep, 10 * 60 * 1000);
 }
 
 module.exports = { startAutoCloseAttendance, sweepOnce };

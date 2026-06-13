@@ -230,11 +230,15 @@ function startAutoPetrolBilling() {
   if (!process.env.MONGO_URI && process.env.NODE_ENV !== 'production') {
     return;
   }
-  console.log('[autoPetrolBilling] scheduled — runs 30s after boot, then every 5 min');
-  // First run 30s after boot so DB / models / mongoose connection are warm.
-  setTimeout(sweepOnce, 30 * 1000);
-  // Then every 5 minutes. Cheap query (today + yesterday only).
-  setInterval(sweepOnce, 5 * 60 * 1000);
+  console.log('[autoPetrolBilling] ✓ scheduled — every 5 min');
+  // Each tick wrapped so a single thrown error (DB hiccup, schema
+  // mismatch on a malformed row) can never kill the cron loop.
+  const safeTick = async () => {
+    try { await sweepOnce(); }
+    catch (e) { console.warn('[autoPetrolBilling] tick crashed:', e?.message || e); }
+  };
+  setTimeout(safeTick, 30 * 1000);
+  setInterval(safeTick, 5 * 60 * 1000);
 }
 
 module.exports = { startAutoPetrolBilling, sweepOnce };
