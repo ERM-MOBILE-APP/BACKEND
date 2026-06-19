@@ -988,7 +988,16 @@ exports.locationPing = async (req, res) => {
     // positions sometimes have a slightly looser radius). Anything
     // wider gets the live presence updated but NOT polylined.
     const accNum = typeof accuracy === 'number' ? accuracy : null;
-    const acceptableAccuracy = accNum == null || accNum <= 50;
+    // #310 — Tightened from 50m → 35m to match the mobile anti-jitter
+    // filter (services/locationTask.ts ACCURACY_GATE_M = 30m, plus a
+    // 5m headroom for timestamp skew between the device clock and the
+    // server timestamp the filter uses). Before this change the backend
+    // accepted fixes the mobile filter would never even have sent,
+    // because the mobile WAS sending pre-filtered fixes but a manual
+    // checkin/checkout could still slip through at 50m. Now both ends
+    // gate at the same effective radius — every point that lands in
+    // the audit polyline is GPS-grade.
+    const acceptableAccuracy = accNum == null || accNum <= 35;
     // isStationary flag from the mobile anti-jitter filter. When true,
     // the mobile sent the held anchor (not a fresh GPS reading) so the
     // polyline shouldn't be extended with what is effectively the same
