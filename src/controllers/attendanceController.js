@@ -176,13 +176,31 @@ const monthBounds = (month, year) => {
 };
 
 // POST /api/attendance/checkin  body: { location: 'remote' | 'office' }
+//
+// #336 — Now supports RESUME after an accidental (or intentional) check-out.
+// If the employee already has a completed session earlier in the same
+// day (i.e. record.checkOut is set), tapping Check In again does NOT
+// create a fresh record and does NOT reset the working-hours timer.
+// Instead:
+//   • record.checkIn is stamped with the new session's start
+//   • record.checkOut is cleared (signals "currently working")
+//   • record.accumulatedSeconds (rolled up on the prior checkout) is
+//     preserved — the client-side timer resumes from that base
+//   • record.firstCheckIn stays pinned to the day's first arrival
+// The completed session's {checkIn, checkOut, ...} tuple was already
+// pushed into record.sessions[] by the checkout handler, so audit
+// history is intact.
 exports.checkIn = async (req, res) => {
   try {
     const date = todayISO();
     const { location = 'office', lat, lng, accuracy } = req.body || {};
 
     let record = await Attendance.findOne({ user: req.user.id, date });
-    if (record && record.checkIn) {
+
+    // Only block if currently in an OPEN session (checkIn set, no
+    // matching checkOut). A row with both checkIn AND checkOut set is
+    // a completed session and the employee is free to Resume Work.
+    if (record && record.checkIn && !record.checkOut) {
       return res.status(400).json({ message: 'Already checked in today' });
     }
 
@@ -207,28 +225,54 @@ exports.checkIn = async (req, res) => {
     const istMinute = parseInt(istParts.find(p => p.type === 'minute')?.value || '0', 10);
     const isLate =
       istHour > 10 || (istHour === 10 && istMinute >= 1);
-    const status = isLate ? 'late' : 'present';
+    // #336 — on a RESUME check-in, don't overwrite the day's late/present
+    // status. Late is based on the FIRST arrival only. If firstCheckIn
+    // is already set, keep whatever status the day earned that morning.
+    const isResume = !!(record && record.firstCheckIn);
+    const status   = isResume
+      ? (record.status || 'present')
+      : (isLate ? 'late' : 'present');
 
     const checkInLat = (typeof lat === 'number' && isFinite(lat)) ? lat : null;
     const checkInLng = (typeof lng === 'number' && isFinite(lng)) ? lng : null;
 
     if (!record) {
+      // First check-in of the day → fresh row, zeroed timers.
       record = await Attendance.create({
         user: req.user.id,
         date,
         checkIn: now,
+        firstCheckIn: now,          // #336 snapshot for reports
         location,
         status,
         checkInLat, checkInLng,
         autoCheckedOut: false,
+        accumulatedSeconds: 0,
+        sessions: [],
       });
     } else {
-      record.checkIn = now;
+      // Existing row — either a first check-in on a pre-created shell
+      // OR a #336 Resume (record.checkOut was set). Either way:
+      //   • Stamp the new session's start on record.checkIn
+      //   • Clear record.checkOut (signals "working")
+      //   • Preserve accumulatedSeconds and sessions[] — the completed
+      //     sessions and their duration are already rolled up
+      record.checkIn  = now;
+      record.checkOut = null;                       // #336 reopen — "working"
+      if (!record.firstCheckIn) record.firstCheckIn = now;
       record.location = location;
       record.status   = status;
       record.checkInLat = checkInLat;
       record.checkInLng = checkInLng;
-      record.autoCheckedOut = false;
+      // Don't stamp checkOut coords on the row here — those belong to
+      // the last completed session and live inside sessions[].
+      record.checkOutLat = null;
+      record.checkOutLng = null;
+      record.autoCheckedOut  = false;
+      // earlyCheckoutLop is stamped at checkout — resuming clears the
+      // flag; if they check out early again the checkout handler will
+      // re-evaluate and restamp based on the new checkout time.
+      record.earlyCheckoutLop = false;
       await record.save();
     }
 
@@ -277,8 +321,34 @@ exports.checkOut = async (req, res) => {
     }
     const now = new Date();
     record.checkOut = now;
+    // ─── #336 Roll up session into accumulated total ────────────────
+    // Compute THIS session's duration (checkIn → now), add it into the
+    // running accumulatedSeconds, then derive workedHours from the
+    // accumulated total. Also push the completed pair into sessions[]
+    // so HR audit reports can list every in/out cycle for the day.
+    const sessionSeconds = Math.max(
+      0,
+      Math.round((now.getTime() - new Date(record.checkIn).getTime()) / 1000),
+    );
+    record.accumulatedSeconds = Math.max(0, (record.accumulatedSeconds || 0) + sessionSeconds);
+    // workedHours = TOTAL of all sessions today (not just this one).
+    // Keeps HRMS reports / Payroll compatible without any changes.
     record.workedHours =
-      Math.round(((record.checkOut - record.checkIn) / 3600000) * 100) / 100;
+      Math.round((record.accumulatedSeconds / 3600) * 100) / 100;
+    // Coordinates for THIS session's checkout land on the row (they
+    // represent the last known location) AND inside the session record.
+    const _checkOutLatForSession = (typeof lat === 'number' && isFinite(lat)) ? lat : null;
+    const _checkOutLngForSession = (typeof lng === 'number' && isFinite(lng)) ? lng : null;
+    if (!Array.isArray(record.sessions)) record.sessions = [];
+    record.sessions.push({
+      checkIn:  record.checkIn,
+      checkOut: now,
+      checkInLat:  record.checkInLat  ?? null,
+      checkInLng:  record.checkInLng  ?? null,
+      checkOutLat: _checkOutLatForSession,
+      checkOutLng: _checkOutLngForSession,
+      durationSeconds: sessionSeconds,
+    });
 
     // ─── Early-checkout policy (Jun 2026 — wall-clock 5:30 PM IST) ────
     // HR's standard end-of-day is 5:30 PM IST. If the employee taps
@@ -555,10 +625,20 @@ exports.checkOut = async (req, res) => {
 };
 
 // GET /api/attendance/today
+//
+// #336 — response now carries the multi-session shape so the frontend
+// timer can resume across page reloads / app restarts:
+//   • firstCheckIn        — the day's very first arrival (for display)
+//   • accumulatedSeconds  — total time from all COMPLETED sessions
+//   • sessions[]          — chronological history of completed sessions
+//   • isOnBreak           — true when the employee has checked out at
+//                           least once today but the workday isn't
+//                           "done"; the frontend uses this to swap the
+//                           button label from "Check In" → "Resume Work"
 exports.getToday = async (req, res) => {
   try {
     const date = todayISO();
-    const record = await Attendance.findOne({ user: req.user.id, date });
+    const record = await Attendance.findOne({ user: req.user.id, date }).lean();
 
     if (!record) {
       return res.json({
@@ -566,26 +646,49 @@ exports.getToday = async (req, res) => {
         shiftName: 'General Shift',
         checkIn: null,
         checkOut: null,
+        firstCheckIn: null,
         location: '',
         workedHours: 0,
+        accumulatedSeconds: 0,
+        sessions: [],
+        isOnBreak: false,
         status: 'absent',
       });
     }
 
-    let workedHours = record.workedHours || 0;
-    if (record.checkIn && !record.checkOut) {
-      workedHours =
-        Math.round(((Date.now() - new Date(record.checkIn).getTime()) / 3600000) * 100) /
-        100;
+    // Live workedHours: while a session is open, include the running
+    // in-progress seconds so the top card and HRMS live views tick
+    // upward. When on break, only show the accumulated total.
+    const accumulated = Number(record.accumulatedSeconds || 0);
+    const isWorking = !!(record.checkIn && !record.checkOut);
+    let liveSeconds = accumulated;
+    if (isWorking) {
+      const runningSec = Math.max(
+        0,
+        Math.round((Date.now() - new Date(record.checkIn).getTime()) / 1000),
+      );
+      liveSeconds = accumulated + runningSec;
     }
+    const workedHours = Math.round((liveSeconds / 3600) * 100) / 100;
+
+    // isOnBreak — employee finished a session but hasn't started a new
+    // one yet. Only true within the same working day (checkOut set and
+    // no new checkIn after it). If it's a fresh row with just a first
+    // arrival, they're either working or haven't started; not on break.
+    const isOnBreak = !!(record.checkOut && !isWorking && record.firstCheckIn);
 
     res.json({
       date: record.date,
       shiftName: record.shift || 'General Shift',
-      checkIn: record.checkIn,
+      checkIn:  record.checkIn,
       checkOut: record.checkOut,
+      firstCheckIn: record.firstCheckIn || record.checkIn || null,
       location: record.location,
       workedHours,
+      accumulatedSeconds: accumulated,
+      liveSeconds,                     // convenient for clients that want it precomputed
+      sessions: Array.isArray(record.sessions) ? record.sessions : [],
+      isOnBreak,
       status: record.status,
     });
   } catch (err) {
@@ -654,9 +757,15 @@ exports.getCalendar = async (req, res) => {
       records.map((r) => ({
         date: r.date,
         status: r.status,
-        checkIn: r.checkIn,
+        // #342 Multi-session: show day's first arrival on calendar
+        // click, not the latest resume. Fallback keeps pre-upgrade rows
+        // rendering unchanged.
+        checkIn: r.firstCheckIn || r.checkIn,
+        firstCheckIn: r.firstCheckIn || r.checkIn,
         checkOut: r.checkOut,
         workedHours: r.workedHours,
+        accumulatedSeconds: Number(r.accumulatedSeconds || 0),
+        sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
       }))
     );
   } catch (err) {
@@ -761,6 +870,10 @@ exports.getSummary = async (req, res) => {
 
 // GET /api/attendance/history?month=&year=
 // Daily history list for the month
+//
+// #342 — Now includes multi-session fields so ERM Mobile / Web history
+// cards render the day's FIRST arrival for Check In (not the latest
+// resume) and the sum of all sessions for Work Hours.
 exports.getHistory = async (req, res) => {
   try {
     const month = parseInt(req.query.month, 10);
@@ -782,9 +895,17 @@ exports.getHistory = async (req, res) => {
         _id: r._id,
         date: r.date,
         status: r.status,
-        checkIn: r.checkIn,
+        // #342 — expose firstCheckIn so the client can display the
+        // day's first arrival. Fallback to checkIn for rows created
+        // before the multi-session upgrade.
+        checkIn: r.firstCheckIn || r.checkIn,
+        firstCheckIn: r.firstCheckIn || r.checkIn,
+        // checkOut = last session end for the day.
         checkOut: r.checkOut,
+        // workedHours reflects accumulatedSeconds / 3600 (multi-session sum).
         workedHours: r.workedHours,
+        accumulatedSeconds: Number(r.accumulatedSeconds || 0),
+        sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
         location: r.location,
         shift: r.shift || 'General Shift',
       }))
@@ -1111,9 +1232,26 @@ exports.autoCheckOut = async (req, res) => {
       return res.json({ ok: true, message: 'Already checked out.', record });
     }
     const now = new Date();
+    // #336 — mirror the manual checkout path: roll the running session
+    // duration into accumulatedSeconds and archive the pair in sessions[].
+    const sessionSeconds = Math.max(
+      0,
+      Math.round((now.getTime() - new Date(record.checkIn).getTime()) / 1000),
+    );
+    record.accumulatedSeconds = Math.max(0, (record.accumulatedSeconds || 0) + sessionSeconds);
     record.checkOut       = now;
-    record.workedHours    = Math.round(((now - record.checkIn) / 3600000) * 100) / 100;
+    record.workedHours    = Math.round((record.accumulatedSeconds / 3600) * 100) / 100;
     record.autoCheckedOut = true;
+    if (!Array.isArray(record.sessions)) record.sessions = [];
+    record.sessions.push({
+      checkIn:  record.checkIn,
+      checkOut: now,
+      checkInLat:  record.checkInLat  ?? null,
+      checkInLng:  record.checkInLng  ?? null,
+      checkOutLat: null,
+      checkOutLng: null,
+      durationSeconds: sessionSeconds,
+    });
     if (record.workedHours < 4) record.status = 'halfday';
     await record.save();
 
@@ -1840,22 +1978,5 @@ exports.lockOfficeAnchor = async (req, res) => {
   } catch (err) {
     console.error("lockOfficeAnchor error:", err);
     return res.status(500).json({ message: "Server error", error: err.message });
-  }
-};
-
-// GET /api/attendance/admin/lock-office (x-admin-secret)
-exports.getLockedOfficeAnchor = async (req, res) => {
-  const expected = (process.env.ADMIN_SECRET || "").trim();
-  const got      = (req.headers["x-admin-secret"] || "").trim();
-  if (!expected)        return res.status(503).json({ message: "ADMIN_SECRET not configured." });
-  if (got !== expected) return res.status(401).json({ message: "Missing/invalid x-admin-secret." });
-
-  const SystemConfig = require("../models/SystemConfig");
-  if (!SystemConfig) return res.json({ officeAnchor: null });
-  try {
-    const cfg = await SystemConfig.findOne({}).lean();
-    res.json({ officeAnchor: cfg && cfg.officeAnchor ? cfg.officeAnchor : null });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
   }
 };

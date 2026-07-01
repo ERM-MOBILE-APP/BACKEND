@@ -28,6 +28,52 @@ const attendanceSchema = new mongoose.Schema(
     // True when the system auto-checked-out because GPS turned off.
     autoCheckedOut: { type: Boolean, default: false },
 
+    // ── #336 Multi-session support (accidental check-out safety net) ──
+    // Employees would sometimes hit "Check Out" by mistake early in the
+    // day, then panic because tapping Check In again reset their timer
+    // back to 00:00 and looked like they'd lost the morning. HR ended
+    // up manually editing rows to give people their hours back — clearly
+    // unsustainable.
+    //
+    // With this schema addition, a workday is now a sequence of
+    // check-in / check-out "sessions". The top-level `checkIn` /
+    // `checkOut` still exist for backward compatibility (they hold the
+    // FIRST check-in of the day and the LATEST check-out respectively),
+    // but the source of truth for total time worked is
+    // `accumulatedSeconds` — the sum of every completed session's
+    // duration. When an employee taps Check In again on the same day,
+    // the timer resumes from `accumulatedSeconds` instead of restarting
+    // from zero. Break time between checkout and re-check-in is NOT
+    // counted (only session durations are summed).
+    //
+    // firstCheckIn — snapshot of the day's very first check-in time.
+    //                Preserved even after multiple re-checkins so
+    //                reports/downloads can still show "arrival time".
+    // accumulatedSeconds — rolling total of completed session durations
+    //                      in whole seconds. Rolled up at each checkout.
+    // sessions[]   — chronological history of every completed session
+    //                so audit reports can list "In 09:00 → Out 12:00,
+    //                In 12:05 → Out 18:00" without recomputing.
+    firstCheckIn:       { type: Date, default: null },
+    accumulatedSeconds: { type: Number, default: 0 },
+    sessions: {
+      type: [
+        new mongoose.Schema(
+          {
+            checkIn:     { type: Date, required: true },
+            checkOut:    { type: Date, required: true },
+            checkInLat:  { type: Number, default: null },
+            checkInLng:  { type: Number, default: null },
+            checkOutLat: { type: Number, default: null },
+            checkOutLng: { type: Number, default: null },
+            durationSeconds: { type: Number, default: 0 },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     // ── Daily route summary (filled at check-out from LocationPings) ──
     // totalDistanceKm — sum of haversine across consecutive pings between
     // checkIn and checkOut. This is the canonical "how far did the
