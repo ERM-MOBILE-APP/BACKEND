@@ -33,15 +33,19 @@ function istDateStr(d) {
   return t.toISOString().slice(0, 10);
 }
 
-// Last IST midnight — every doc whose `date` is BEFORE this string with an
-// open check-in is a candidate for auto-close.
+// #369 — Return yesterday 23:59:59.999 IST as a proper UTC Date object.
+// The previous version stored UTC 23:59 (which the frontend then rendered
+// as 05:29 AM IST because it converts back to IST at display time). We
+// want the wall-clock time to read as "11:59 PM" in IST.
 function lastIstMidnight() {
   const now = new Date();
-  const ist = new Date(now.getTime() + IST_OFFSET_MIN * 60 * 1000);
-  // Construct end-of-yesterday IST at 23:59:59.999 — used as the checkOut stamp.
-  ist.setUTCHours(0, 0, 0, 0);                  // start of today IST in UTC terms
-  ist.setUTCMinutes(ist.getUTCMinutes() - 1);   // back one minute → yesterday 23:59 IST
-  return ist;
+  // Shift now into IST wall time.
+  const istNow = new Date(now.getTime() + IST_OFFSET_MIN * 60 * 1000);
+  // Zero the IST clock, then step back 1ms so we land on yesterday 23:59:59.999 IST.
+  istNow.setUTCHours(0, 0, 0, 0);
+  const yesterdayIst2359 = new Date(istNow.getTime() - 1);   // 23:59:59.999 IST
+  // Convert back to UTC for Mongo storage.
+  return new Date(yesterdayIst2359.getTime() - IST_OFFSET_MIN * 60 * 1000);
 }
 
 async function sweepOnce() {

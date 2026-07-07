@@ -6,6 +6,7 @@ const cors = require('cors');
 const compression = require('compression');
 const { startKeepAlive } = require('./keepAlive');
 const { startAutoCloseAttendance } = require('./autoCloseAttendance');
+const { startTrackingHealthMonitor } = require('./trackingHealthMonitor');
 const { startAutoPetrolBilling } = require('./autoPetrolBilling');
 
 const app = express();
@@ -150,6 +151,9 @@ app.listen(PORT, function () {
   startKeepAlive(PORT);
   // Sweep open check-ins at IST midnight - mark as absent.
   startAutoCloseAttendance();
+  // #372 — Every 3 min, flag employees whose location pings have stopped
+  // arriving for > 5 min so HR sees "degraded tracking" proactively.
+  startTrackingHealthMonitor();
   // Auto-bill petrol for eligible employees every 5 min - no manual
   // backfill needed.
   startAutoPetrolBilling();

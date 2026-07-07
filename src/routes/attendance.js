@@ -22,6 +22,8 @@ const {
   adminDailyRoutesList,
   adminListRequests,
   adminUpdateRequest,
+  adminMarkStatus,
+  adminPingAnalytics,
   lockOfficeAnchor,
   getLockedOfficeAnchor,
 } = require('../controllers/attendanceController');
@@ -51,7 +53,13 @@ router.get  ('/admin/all',             adminListAll);
 // HRMS proxy AND by ERM Web's manager queue.
 router.get  ('/admin/requests',         adminListRequests);
 router.patch('/admin/requests/:id',     adminUpdateRequest);
+// #352d — HR-only manual status override. Body: { userId|employeeId, date, status, note? }
+router.patch('/admin/mark-status',       adminMarkStatus);
 router.get  ('/admin/live-locations',  adminLiveLocations);
+// #370 — Per-employee ping analytics for a date. Returns count, first/last
+// ping, elapsed vs pinged minutes, coverage %, largest gap. Header:
+// x-admin-secret. Query: ?date=YYYY-MM-DD (defaults to today).
+router.get  ('/admin/ping-analytics',  adminPingAnalytics);
 
 // Office anchor lock (#281). POST locks the anchor to an employee's
 // current GPS (or to explicit lat/lng); GET reads the currently

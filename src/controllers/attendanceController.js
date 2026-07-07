@@ -223,15 +223,43 @@ exports.checkIn = async (req, res) => {
     }).formatToParts(now);
     const istHour   = parseInt(istParts.find(p => p.type === 'hour')?.value   || '0', 10);
     const istMinute = parseInt(istParts.find(p => p.type === 'minute')?.value || '0', 10);
-    const isLate =
-      istHour > 10 || (istHour === 10 && istMinute >= 1);
+    // #352a — Three-tier check-in classification per HR policy (Jul 2026):
+    //   ≤ 10:00                    → present  (on-time)
+    //   10:01 AM – 10:30 AM        → late     (still counted present, HR sees Late flag)
+    //   > 10:30 AM                 → absent   (marked absent even though they DID
+    //                                          check in; employee can file an
+    //                                          Attendance Regularisation request
+    //                                          which, once the manager approves it,
+    //                                          the adminUpdateRequest handler flips
+    //                                          to 'permission'. HR can also
+    //                                          manually mark 'present' via the
+    //                                          adminMarkStatus endpoint.)
+    //
+    // Rationale: the old rule marked ANY check-in after 10:01 as Late
+    // regardless of how late they were — a 4-hour delay looked the same
+    // as a 2-minute one. The new rule gives HR + payroll a clean signal
+    // that the late tier ends at 10:30 and anything beyond is treated as
+    // an unexplained absence until the employee justifies it.
+    const minutesSinceMidnight = istHour * 60 + istMinute;
+    const LATE_START = 10 * 60 + 1;    // 10:01
+    const LATE_END   = 10 * 60 + 30;   // 10:30
+    let checkInStatus;
+    if (minutesSinceMidnight < LATE_START) {
+      checkInStatus = 'present';
+    } else if (minutesSinceMidnight <= LATE_END) {
+      checkInStatus = 'late';
+    } else {
+      checkInStatus = 'absent';
+    }
+    // Preserve legacy name for the one downstream `isLate` reference below.
+    const isLate = checkInStatus === 'late';
     // #336 — on a RESUME check-in, don't overwrite the day's late/present
     // status. Late is based on the FIRST arrival only. If firstCheckIn
     // is already set, keep whatever status the day earned that morning.
     const isResume = !!(record && record.firstCheckIn);
     const status   = isResume
       ? (record.status || 'present')
-      : (isLate ? 'late' : 'present');
+      : checkInStatus;
 
     const checkInLat = (typeof lat === 'number' && isFinite(lat)) ? lat : null;
     const checkInLng = (typeof lng === 'number' && isFinite(lng)) ? lng : null;
@@ -350,36 +378,28 @@ exports.checkOut = async (req, res) => {
       durationSeconds: sessionSeconds,
     });
 
-    // ─── Early-checkout policy (Jun 2026 — wall-clock 5:30 PM IST) ────
-    // HR's standard end-of-day is 5:30 PM IST. If the employee taps
-    // Check Out BEFORE 5:30 PM IST, treat it as a short day:
-    //   • If the employee has applied for a Permission for today
-    //     (any status — pending / approved; rejected does NOT count) →
-    //     status becomes 'permission'. HR is the final arbiter via the
-    //     permission record; the attendance row just reflects that an
-    //     early departure was filed with a reason.
-    //   • If there is no permission filed at all → mark the row
-    //     'halfday' with earlyCheckoutLop=true. The LOP rule
-    //     (utils/leavePolicy) counts each halfday as 0.5 LOP once the
-    //     employee crosses the 2-per-month free quota.
+    // ─── Halfday policy (#352b — Jul 2026 HR rule, final) ────────────
+    // Rule: hours-only, no time-of-day gate.
+    //   • Worked <  5 h → halfday (or permission if a permission
+    //                     request is on file for the day)
+    //   • Worked ≥  5 h → keep existing status (present / late)
     //
-    // Policy refinement (Jun 2026 HR request): the old rule required
-    // APPROVED permission — but employees said it was unfair to be
-    // pre-marked halfday LOP when HR hadn't acted on their request yet,
-    // and HR confirmed they prefer the new rule (any non-rejected
-    // permission excuses the early checkout, and if HR rejects later
-    // they'll manually mark the day halfday).
-    const istParts2 = new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'Asia/Kolkata',
-      hour:   '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).formatToParts(now);
-    const coHour   = parseInt(istParts2.find(p => p.type === 'hour')?.value   || '0', 10);
-    const coMinute = parseInt(istParts2.find(p => p.type === 'minute')?.value || '0', 10);
-    const isEarlyCheckout = coHour < 17 || (coHour === 17 && coMinute < 30);
+    // The check-out timestamp is NOT consulted. An employee who
+    // arrives at 7 AM and leaves at 12 PM has clocked 5 hours and
+    // gets full-day credit. An employee who clocks 4 hours regardless
+    // of when they arrived/left gets halfday.
+    //
+    // Worked-hours read from the running total. In the multi-session
+    // schema this is `accumulatedSeconds`; on legacy rows we fall back
+    // to `workedHours` which the checkout handler set just above.
+    const HALFDAY_THRESHOLD_HOURS = 5;
+    const workedHoursForPolicy =
+      typeof record.accumulatedSeconds === 'number' && record.accumulatedSeconds > 0
+        ? record.accumulatedSeconds / 3600
+        : Number(record.workedHours || 0);
+    const isHalfDay = workedHoursForPolicy < HALFDAY_THRESHOLD_HOURS;
 
-    if (isEarlyCheckout) {
+    if (isHalfDay) {
       let hasPermissionRequest = false;
       try {
         const perm = await Leave.findOne({
@@ -396,13 +416,14 @@ exports.checkOut = async (req, res) => {
         record.status = 'permission';
         record.earlyCheckoutLop = false;
       } else {
-        // No permission filed at all → half-day LOP.
+        // No permission filed → half-day LOP.
         record.status = 'halfday';
         record.earlyCheckoutLop = true;
       }
     } else {
-      // Checked out at or after 5:30 PM — definitely not an early-out.
-      // Clear any stale flag in case the row got re-saved.
+      // EITHER checked out at/after 5:30 PM OR worked ≥ 5 h — full-day
+      // credit. Keep the existing status (e.g. 'late' from morning
+      // arrival) and clear any stale LOP flag.
       record.earlyCheckoutLop = false;
     }
 
@@ -1027,6 +1048,37 @@ exports.adminUpdateRequest = async (req, res) => {
     const fresh = await AttendanceRequest.findByIdAndUpdate(req.params.id, update, { new: true })
       .populate('user', 'firstName lastName name employeeId email');
     if (!fresh) return res.status(404).json({ message: 'Request not found' });
+
+    // ─── #352c — Sync approved late-check-in requests to Permission ─────
+    // Per the Jul 2026 HR policy: if an employee's Attendance row for
+    // this date is 'absent' (because they checked in after 10:30 AM) and
+    // a manager (or HR) has now APPROVED their attendance-regularisation
+    // request, flip the day's status to 'permission' automatically.
+    // This is what closes the loop between the "late check-in → Absent"
+    // rule in checkIn() and the employee's ability to justify it.
+    //
+    // We intentionally only touch Absent rows here — if the day was
+    // 'present' or 'late', an approved request means HR is fine with
+    // the arrival window but the row itself is already correct.
+    if (update.status === 'approved') {
+      try {
+        const attendanceRow = await Attendance.findOne({
+          user: fresh.user?._id || fresh.user,
+          date: fresh.date,
+        });
+        if (attendanceRow && attendanceRow.status === 'absent') {
+          attendanceRow.status = 'permission';
+          await attendanceRow.save();
+          console.log(`[attendance.adminUpdateRequest] Absent → Permission for user=${fresh.user?.employeeId || fresh.user} date=${fresh.date}`);
+        }
+      } catch (syncErr) {
+        // Non-fatal: the request approval itself succeeded. If the
+        // attendance row didn't flip, HR can still use the manual
+        // markStatus endpoint to fix it.
+        console.warn('[attendance.adminUpdateRequest] status sync failed:', syncErr.message);
+      }
+    }
+
     // Notify the employee so the bell updates. Attribution defaults to
     // "by HR" because this endpoint is what HRMS hits; the body
     // distinguishes the HR final call from the manager's earlier
@@ -1071,6 +1123,87 @@ exports.markStatus = async (req, res) => {
     );
     res.json(record);
   } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+// #352d — PATCH /api/attendance/admin/mark-status  (x-admin-secret)
+//
+// HR-only endpoint. Lets HR override the derived status on any
+// attendance row — the common case is flipping Absent (late check-in
+// after 10:30 AM) to Present after a regularisation conversation.
+//
+// Body: { userId, employeeId, date, status, note? }
+//   • userId OR employeeId — locate the target attendance row.
+//   • date                 — YYYY-MM-DD.
+//   • status               — one of the allowed enum values.
+//   • note                 — optional HR comment stored on the row.
+//
+// Response: { success: true, item: <fresh Attendance row> } on success.
+// No auto-create: if the row doesn't exist, returns 404 (HR should
+// create it via the normal check-in/regularisation flow first).
+exports.adminMarkStatus = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  try {
+    const { userId, employeeId, date, status, note } = req.body || {};
+    if (!date)   return res.status(400).json({ message: 'date is required (YYYY-MM-DD)' });
+    if (!status) return res.status(400).json({ message: 'status is required' });
+    if (!['present', 'leave', 'permission', 'absent', 'late', 'halfday'].includes(status)) {
+      return res.status(400).json({
+        message: 'status must be one of: present, leave, permission, absent, late, halfday',
+      });
+    }
+
+    // Resolve the user reference. Prefer explicit userId; fall back to
+    // employeeId lookup so HR can post from a UI that only has the
+    // human id ("TES047") on hand.
+    let userRef = null;
+    if (userId && mongoose.Types.ObjectId.isValid(String(userId))) {
+      userRef = userId;
+    } else if (employeeId) {
+      const u = await User
+        .findOne({ employeeId: String(employeeId).trim().toUpperCase() })
+        .select('_id')
+        .lean();
+      if (!u) return res.status(404).json({ message: `Employee ${employeeId} not found` });
+      userRef = u._id;
+    } else {
+      return res.status(400).json({ message: 'userId or employeeId is required' });
+    }
+
+    const record = await Attendance.findOne({ user: userRef, date });
+    if (!record) return res.status(404).json({ message: `No attendance row for ${date}` });
+
+    const previous = record.status;
+    record.status = status;
+    // When we flip AWAY from halfday/absent, clear the LOP flag so the
+    // leavePolicy tallies get updated correctly on next read.
+    if (status !== 'halfday' && status !== 'absent') {
+      record.earlyCheckoutLop = false;
+    }
+    await record.save();
+
+    // Best-effort notify the employee so their ERM bell reflects it.
+    try {
+      const { notify } = require('../utils/notify');
+      await notify(userRef, {
+        title: `Attendance updated by HR`,
+        body:  `Your ${date} attendance was changed from ${previous} to ${status} by HR` +
+               (note ? `. Note: "${note}"` : '.'),
+        type:  'attendance',
+        link:  '/(tabs)/attendance',
+      });
+    } catch (e) {
+      console.warn('[attendance.adminMarkStatus] notify failed:', e.message);
+    }
+
+    res.json({ success: true, item: record });
+  } catch (err) {
+    console.error('[attendance.adminMarkStatus]', err);
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
@@ -1168,6 +1301,31 @@ exports.locationPing = async (req, res) => {
     if (stationary) {
       return res.json({ ok: true, accepted: true, stationary: true });
     }
+
+    // #373 — DEDUPE WINDOW: 100 seconds.
+    // Target cadence is 1 ping every 120 s (mobile OS task interval).
+    // Anything arriving < 100 s after the previous accepted row is
+    // treated as a burst / duplicate / replay — presence + lastLocation
+    // are still updated (freshness clock stays current) but the audit
+    // row insert is skipped. The 20-s safety margin below 120 s covers
+    // normal OS delivery jitter without dropping a real scheduled tick.
+    const lastPing = await LocationPing
+      .findOne({ user: req.user.id, date })
+      .sort({ recordedAt: -1 })
+      .select('recordedAt')
+      .lean();
+    if (lastPing) {
+      const gapSec = (now.getTime() - new Date(lastPing.recordedAt).getTime()) / 1000;
+      if (gapSec < 100) {
+        return res.json({
+          ok: true,
+          accepted: false,
+          reason: 'duplicate-within-100s',
+          lastPingAgeSec: Math.round(gapSec),
+        });
+      }
+    }
+
     await LocationPing.create({
       user: req.user.id,
       date,
@@ -1345,14 +1503,27 @@ exports.adminListAll = async (req, res) => {
     };
     for (const a of items) {
       if (!a.checkIn) continue;
-      // Only override the on-time / late distinction. Leave / permission /
-      // halfday / absent rows keep their own status — those are not about
-      // when the employee arrived.
+      // #352a — Only override present/late/absent based on arrival time.
+      // Leave / permission / halfday rows keep their own status because:
+      //   • permission = manager approved a late-arrival regularisation
+      //     request, and we must not overwrite that back to Absent.
+      //   • halfday   = set at checkout because worked hours were < 5;
+      //     unrelated to arrival time.
+      //   • leave     = HR pre-approved leave; time-of-day irrelevant.
       const s = String(a.status || '').toLowerCase();
-      if (s !== 'present' && s !== 'late') continue;
+      if (s !== 'present' && s !== 'late' && s !== 'absent') continue;
       const { h, m } = istHm(a.checkIn);
-      const isLate = h > 10 || (h === 10 && m >= 1);
-      a.status = isLate ? 'late' : 'present';
+      const mins = h * 60 + m;
+      if (mins < 10 * 60 + 1) {
+        a.status = 'present';
+      } else if (mins <= 10 * 60 + 30) {
+        a.status = 'late';
+      } else {
+        // > 10:30 AM check-in — reclassify to Absent (unless the row was
+        // already flipped to Permission by a manager-approved
+        // regularisation, which we skipped above).
+        a.status = 'absent';
+      }
     }
 
     // ─── Overlay approved leaves + permissions onto the day(s) ────────
@@ -1570,15 +1741,14 @@ exports.adminLiveLocations = async (req, res) => {
         }
 
         const ageMin = recordedAt ? (Date.now() - new Date(recordedAt).getTime()) / 60000 : 999;
-        // 10 min stale window (tightened from 25 min in Jun 2026 at HR's
-        // request). The mobile app runs four redundant recovery layers:
-        //   • 30-sec foreground GPS watcher       (catches GPS toggles)
-        //   • 30-sec bg-task guardian             (catches OEM kills)
-        //   • OS-scheduled 90-sec background pings (the workhorse)
-        //   • No self-stop on 401 — task stays armed across token blips
-        // 10 min ≈ 6 missed pings, still enough to bridge a normal OEM
-        // Doze cycle but tight enough that HR sees a real-time picture.
-        const stale = ageMin > 10;
+        // #370 — Widened from 10 → 15 min. Android Doze deep-mode cycles
+        // routinely delay work by 15 min even on whitelisted apps, so a
+        // 10-min window flagged the whole fleet Offline whenever the
+        // screen was locked for a while. 15 min bridges normal Doze
+        // without letting truly-dead sessions linger too long. Paired
+        // with the mobile app's four redundant recovery layers this
+        // gives HR a realistic real-time picture again.
+        const stale = ageMin > 15;
 
         if (!stale) {
           // ── FRESH PING WINS ────────────────────────────────────────
@@ -1978,5 +2148,152 @@ exports.lockOfficeAnchor = async (req, res) => {
   } catch (err) {
     console.error("lockOfficeAnchor error:", err);
     return res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+// GET /api/attendance/admin/lock-office (x-admin-secret)
+exports.getLockedOfficeAnchor = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || "").trim();
+  const got      = (req.headers["x-admin-secret"] || "").trim();
+  if (!expected)        return res.status(503).json({ message: "ADMIN_SECRET not configured." });
+  if (got !== expected) return res.status(401).json({ message: "Missing/invalid x-admin-secret." });
+
+  try {
+    const SystemConfig = require("../models/SystemConfig");
+    const doc = await SystemConfig.findOne({}).lean();
+    return res.json({ success: true, officeAnchor: doc?.officeAnchor || null });
+  } catch (err) {
+    console.error("getLockedOfficeAnchor error:", err);
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
+/**
+ * GET /api/attendance/admin/ping-analytics?date=YYYY-MM-DD
+ * Header: x-admin-secret
+ *
+ * Per-employee tracking health for one day. For each active employee it
+ * reports: check-in / check-out timestamps, ping count, first/last ping,
+ * elapsed vs pinged minutes, coverage percentage, and the largest gap.
+ *
+ * Coverage rule: expected pings ≈ shift-minutes / 2 (1 ping per 2 min).
+ * If pings received is significantly less, tracking dropped mid-shift.
+ *
+ * #370 — Built so HR can objectively answer "did tracking cover the
+ * whole shift for every employee?" instead of eyeballing the map.
+ */
+exports.adminPingAnalytics = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected) return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  try {
+    const User         = require('../models/User');
+    const Attendance   = require('../models/Attendance');
+    const LocationPing = require('../models/LocationPing');
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+
+    // All active employees who have an attendance row for the day.
+    const users = await User.find({ isActive: { $ne: false } })
+      .select('_id name firstName lastName employeeId')
+      .lean();
+
+    const attRows = await Attendance.find({ date }).lean();
+    const attByUser = new Map(attRows.map(a => [String(a.user), a]));
+
+    // Aggregate pings per user in one round-trip.
+    const pingsAgg = await LocationPing.aggregate([
+      { $match: { date } },
+      { $sort:  { user: 1, recordedAt: 1 } },
+      { $group: {
+          _id:       '$user',
+          count:     { $sum: 1 },
+          first:     { $first: '$recordedAt' },
+          last:      { $last:  '$recordedAt' },
+          samples:   { $push:  '$recordedAt' },
+        } },
+    ]);
+    const pingsByUser = new Map(pingsAgg.map(p => [String(p._id), p]));
+
+    const EXPECTED_INTERVAL_MIN = 2;   // one ping every 2 min while tracking
+
+    const analytics = users.map(u => {
+      const att   = attByUser.get(String(u._id));
+      const pings = pingsByUser.get(String(u._id));
+      const fullName = u.name || ((u.firstName || '') + ' ' + (u.lastName || '')).trim() || 'Unknown';
+
+      // No attendance row today → nothing to analyse.
+      if (!att || !att.checkIn) {
+        return {
+          userId: u._id, employeeId: u.employeeId, name: fullName,
+          checkedIn: false, pings: 0, verdict: 'never checked in',
+        };
+      }
+      const checkIn  = new Date(att.checkIn);
+      const checkOut = att.checkOut ? new Date(att.checkOut) : new Date();
+      const shiftMin = Math.max(0, (checkOut.getTime() - checkIn.getTime()) / 60000);
+      const pingCount = pings ? pings.count : 0;
+      const firstPing = pings ? new Date(pings.first) : null;
+      const lastPing  = pings ? new Date(pings.last)  : null;
+      const pingedMin = firstPing && lastPing
+        ? Math.max(0, (lastPing.getTime() - firstPing.getTime()) / 60000)
+        : 0;
+
+      // Largest gap between consecutive pings (minutes).
+      let largestGapMin = 0;
+      if (pings && Array.isArray(pings.samples) && pings.samples.length > 1) {
+        for (let i = 1; i < pings.samples.length; i++) {
+          const g = (new Date(pings.samples[i]).getTime()
+                    - new Date(pings.samples[i-1]).getTime()) / 60000;
+          if (g > largestGapMin) largestGapMin = g;
+        }
+      }
+
+      const expectedPings = Math.floor(shiftMin / EXPECTED_INTERVAL_MIN);
+      const coveragePct = expectedPings > 0
+        ? Math.min(100, Math.round((pingCount / expectedPings) * 100))
+        : 0;
+
+      let verdict;
+      if (pingCount === 0)          verdict = 'no pings received';
+      else if (coveragePct >= 80)   verdict = 'healthy';
+      else if (coveragePct >= 40)   verdict = 'partial';
+      else                          verdict = 'poor';
+
+      return {
+        userId:       u._id,
+        employeeId:   u.employeeId || '',
+        name:         fullName,
+        checkedIn:    true,
+        checkIn:      checkIn.toISOString(),
+        checkOut:     att.checkOut ? checkOut.toISOString() : null,
+        shiftMinutes: Math.round(shiftMin),
+        pings:        pingCount,
+        expectedPings,
+        coveragePct,
+        firstPing:    firstPing ? firstPing.toISOString() : null,
+        lastPing:     lastPing  ? lastPing.toISOString()  : null,
+        pingedMinutes: Math.round(pingedMin),
+        largestGapMinutes: Math.round(largestGapMin),
+        verdict,
+      };
+    });
+
+    // Summary counters.
+    const summary = {
+      totalActive:      users.length,
+      checkedIn:        analytics.filter(a => a.checkedIn).length,
+      healthy:          analytics.filter(a => a.verdict === 'healthy').length,
+      partial:          analytics.filter(a => a.verdict === 'partial').length,
+      poor:             analytics.filter(a => a.verdict === 'poor').length,
+      noPings:          analytics.filter(a => a.verdict === 'no pings received').length,
+      neverCheckedIn:   analytics.filter(a => a.verdict === 'never checked in').length,
+    };
+
+    res.json({ date, summary, employees: analytics });
+  } catch (err) {
+    console.error('adminPingAnalytics error:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
