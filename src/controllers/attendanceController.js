@@ -110,7 +110,12 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
   // Optional time window — when computing for an Attendance row we trim
   // to the actual checkIn → checkOut span so pings from before check-in
   // (e.g. yesterday's tail) or after check-out don't inflate distance.
-  const q = { user: userId, date: dateIso };
+  // #376 — Exclude anchor-echo rows from route calc. Anchor rows are
+  // recorded so HR has a continuous 2-min audit trail, but they carry
+  // the last-known position, not real movement. If we didn't filter,
+  // Haversine-summing them would zero-out (identical points) — but the
+  // simplification step relies on real deltas so keep the query clean.
+  const q = { user: userId, date: dateIso, isAnchor: { $ne: true } };
   if (opts.checkIn || opts.checkOut) {
     q.recordedAt = {};
     if (opts.checkIn)  q.recordedAt.$gte = new Date(opts.checkIn);
@@ -1298,9 +1303,13 @@ exports.locationPing = async (req, res) => {
     if (!acceptableAccuracy) {
       return res.json({ ok: true, accepted: false, reason: 'accuracy>50m' });
     }
-    if (stationary) {
-      return res.json({ ok: true, accepted: true, stationary: true });
-    }
+    // #375 — Stationary anchor echoes ARE recorded now (with isAnchor:true)
+    // so HR has an unbroken 2-min audit trail even during "parked at
+    // client" / "sitting at desk" periods. Distance/polyline queries
+    // filter these out. Previously we returned early here, which left
+    // multi-minute gaps in the DB even though the phone was pinging
+    // correctly — HR mistook the gaps for tracking failures.
+    // The row still goes through the 100-sec dedup gate below.
 
     // #373 — DEDUPE WINDOW: 100 seconds.
     // Target cadence is 1 ping every 120 s (mobile OS task interval).
@@ -1334,9 +1343,12 @@ exports.locationPing = async (req, res) => {
       accuracy: accNum,
       speed:    typeof speed    === 'number' ? speed    : null,
       presence: 'active',
+      // #375 — flag anchor-echo rows so distance / polyline queries can
+      // filter them via { isAnchor: { $ne: true } }.
+      isAnchor: stationary,
     });
 
-    res.json({ ok: true, stationary: false });
+    res.json({ ok: true, stationary });
   } catch (err) {
     console.error('locationPing error:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -2203,12 +2215,19 @@ exports.adminPingAnalytics = async (req, res) => {
     const attByUser = new Map(attRows.map(a => [String(a.user), a]));
 
     // Aggregate pings per user in one round-trip.
+    // #376 — Also count anchor-echo rows separately. A high anchor share
+    // means the employee was stationary a lot (normal for desk workers);
+    // a low anchor share with many gaps means the phone was actually
+    // dying/being throttled — different problem, different fix.
     const pingsAgg = await LocationPing.aggregate([
       { $match: { date } },
       { $sort:  { user: 1, recordedAt: 1 } },
       { $group: {
           _id:       '$user',
           count:     { $sum: 1 },
+          anchorCount: {
+            $sum: { $cond: [{ $eq: ['$isAnchor', true] }, 1, 0] },
+          },
           first:     { $first: '$recordedAt' },
           last:      { $last:  '$recordedAt' },
           samples:   { $push:  '$recordedAt' },
@@ -2261,6 +2280,12 @@ exports.adminPingAnalytics = async (req, res) => {
       else if (coveragePct >= 40)   verdict = 'partial';
       else                          verdict = 'poor';
 
+      // #376 — Split anchor vs moving pings so HR can see whether the
+      // employee was actually stationary (anchor share high) or the
+      // phone was struggling (many gaps + low anchor share).
+      const anchorPings = pings ? (pings.anchorCount || 0) : 0;
+      const movingPings = Math.max(0, pingCount - anchorPings);
+
       return {
         userId:       u._id,
         employeeId:   u.employeeId || '',
@@ -2270,6 +2295,8 @@ exports.adminPingAnalytics = async (req, res) => {
         checkOut:     att.checkOut ? checkOut.toISOString() : null,
         shiftMinutes: Math.round(shiftMin),
         pings:        pingCount,
+        movingPings,
+        anchorPings,
         expectedPings,
         coveragePct,
         firstPing:    firstPing ? firstPing.toISOString() : null,

@@ -29,6 +29,11 @@ const locationPingSchema = new mongoose.Schema(
     accuracy:   { type: Number, default: null },    // metres (best-effort, may be null)
     speed:      { type: Number, default: null },    // m/s (best-effort)
     presence:   { type: String, enum: ['active', 'idle', 'offline'], default: 'active' },
+    // #375 — Marks samples where the mobile anti-jitter filter reported
+    // no confirmed movement (parked, at office, in traffic). Kept so HR
+    // has a continuous audit trail of 2-min pings; polyline/distance
+    // queries filter these out via { isAnchor: { $ne: true } }.
+    isAnchor:   { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );
