@@ -61,6 +61,7 @@ app.use(compression({ threshold: 1024 }));
 app.use(express.json());
 
 const { bootstrapOfficeAnchor } = require('./bootstrapOfficeAnchor');
+const { dedupLocationPings }    = require('./migrations/dedupLocationPings');
 
 mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
@@ -69,6 +70,11 @@ mongoose.connect(process.env.MONGO_URI)
     // is set AND no anchor is locked yet. Safe to leave the env var in
     // place — subsequent restarts no-op once the anchor exists.
     await bootstrapOfficeAnchor();
+    // #379 — Sweep duplicate LocationPing rows and ensure the unique
+    // (user, date, bucket) index exists so future concurrent bursts
+    // are rejected atomically instead of racing through the read-then-
+    // write dedup. Idempotent — no-op once the DB is clean.
+    await dedupLocationPings();
   })
   .catch(err => console.error('MongoDB error:', err));
 
@@ -149,12 +155,12 @@ app.listen(PORT, function () {
   console.log('Server running on port ' + PORT);
   // Kick off the keep-alive cron once the server is up
   startKeepAlive(PORT);
-  // Sweep open check-ins at IST midnight - mark as absent.
-  startAutoCloseAttendance();
-  // #372 — Every 3 min, flag employees whose location pings have stopped
-  // arriving for > 5 min so HR sees "degraded tracking" proactively.
-  startTrackingHealthMonitor();
-  // Auto-bill petrol for eligible employees every 5 min - no manual
-  // backfill needed.
-  startAutoPetrolBilling();
+    // Sweep open check-ins at IST midnight - mark as absent.
+    startAutoCloseAttendance();
+    // #372 - Every 3 min, flag employees whose location pings have stopped
+    // arriving for > 5 min so HR sees "degraded tracking" proactively.
+    startTrackingHealthMonitor();
+    // Auto-bill petrol for eligible employees every 5 min - no manual
+    // backfill needed.
+    startAutoPetrolBilling();
 });

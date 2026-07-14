@@ -11,6 +11,13 @@ const attendanceSchema = new mongoose.Schema(
     date: { type: String, required: true }, // YYYY-MM-DD
     checkIn: { type: Date },
     checkOut: { type: Date },
+    // #404 — Cosmetic IST sidecars so HR opening Robo 3T sees local
+    // wall-clock time next to the authoritative UTC Date fields.
+    // Format: "YYYY-MM-DD HH:mm:ss" in Asia/Kolkata. Set by the
+    // controller on every write; never queried against. Every
+    // existing query keeps using the UTC Date fields.
+    checkInLocal:  { type: String, default: '' },
+    checkOutLocal: { type: String, default: '' },
     location: { type: String, enum: ['remote', 'office', ''], default: '' },
     workedHours: { type: Number, default: 0 },
     status: {
@@ -96,6 +103,18 @@ const attendanceSchema = new mongoose.Schema(
     // (separate from `autoCheckedOut` which is GPS-driven close).
     autoClosed:       { type: Boolean, default: false },
     autoClosedAt:     { type: Date,    default: null },
+
+
+    // #388 HR manual override.
+    // Set to true by /admin/mark-status whenever HR flips a row's
+    // status via the Mark Present button. Downstream code paths that
+    // re-derive status from check-in time MUST honour this flag and
+    // skip re-derivation — otherwise the row flips back to Absent
+    // within seconds of HR clicking Present.
+    hrOverride:       { type: Boolean, default: false, index: true },
+    hrOverrideStatus: { type: String,  default: '' },
+    hrOverrideNote:   { type: String,  default: '' },
+    hrOverrideAt:     { type: Date,    default: null },
   },
   { timestamps: true }
 );

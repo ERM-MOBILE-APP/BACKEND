@@ -24,6 +24,12 @@ const locationPingSchema = new mongoose.Schema(
     employeeId: { type: String, default: '', index: true, trim: true, uppercase: true },
     date:       { type: String, required: true },   // YYYY-MM-DD — for date-range queries
     recordedAt: { type: Date,   required: true, index: true },
+    // #404 — Cosmetic IST sidecar so Robo 3T (and any DB viewer) shows
+    // wall-clock local time next to the authoritative UTC recordedAt.
+    // Format: "YYYY-MM-DD HH:mm:ss" in Asia/Kolkata (IST, UTC+05:30).
+    // Set by the controller at insert time; never queried against.
+    // All existing range queries continue to use recordedAt (UTC Date).
+    recordedAtLocal: { type: String, default: '' },
     lat:        { type: Number, required: true },
     lng:        { type: Number, required: true },
     accuracy:   { type: Number, default: null },    // metres (best-effort, may be null)
@@ -34,12 +40,37 @@ const locationPingSchema = new mongoose.Schema(
     // has a continuous audit trail of 2-min pings; polyline/distance
     // queries filter these out via { isAnchor: { $ne: true } }.
     isAnchor:   { type: Boolean, default: false, index: true },
+    // #379 — 2-minute bucket = floor(recordedAt_ms / 120000). Combined
+    // with the unique compound index below, this makes it PHYSICALLY
+    // impossible for two rows to land in the same 2-min window for the
+    // same user — MongoDB rejects duplicates atomically at insert time.
+    // Replaces the previous read-then-write dedup that raced under
+    // concurrent bursts (3 rows within 69 ms observed for TES080 after
+    // a 20-min bg-task gap fired multiple recovery pings at once).
+    bucket:     { type: Number, required: true, index: true },
   },
   { timestamps: true }
 );
 
 // Compound index for "this user on this date, ordered by time" queries.
 locationPingSchema.index({ user: 1, date: 1, recordedAt: -1 });
+
+// #379/#403 — ATOMIC DEDUP INDEX (partial + unique). One row per
+// employee per 2-min slot. The `partialFilterExpression` gates the
+// uniqueness constraint on rows that have a real bucket number —
+// legacy rows with `bucket: null` (from before bucket became required)
+// are excluded from the index and can't collide with new inserts.
+// Without this filter, if TWO orphaned null-bucket rows existed for
+// the same user+date, every new /location-ping raised E11000 500 →
+// the mobile client rolled back its burst guard → retry → E11000 500
+// again in an infinite loop, silently killing the 2-min cadence.
+locationPingSchema.index(
+  { user: 1, date: 1, bucket: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { bucket: { $type: 'number' } },
+  }
+);
 
 locationPingSchema.plugin(stampEmployeeId);
 

@@ -9,8 +9,33 @@ const {
   isPetrolGpsEmployee,
   PETROL_RATE_RUPEES_PER_KM,
 } = require('../petrolGpsAllowlist');
+// #404 — IST wall-clock formatter for cosmetic DB sidecar fields.
+const { fmtIST } = require('../utils/formatIST');
+// #407 — Approved Leave/Permission overlay onto attendance status.
+const { applyLeavePermissionOverlay } = require('../utils/leaveOverlay');
 
 const isObjId = (v) => v && typeof v === 'string' && /^[a-f0-9]{24}$/i.test(v);
+
+// #397 — In-memory cache: user _id (24-hex string) → employeeId (e.g. "TES080").
+// Populated lazily on the first /location-ping from each user. Lets the
+// per-ping console.log show a human-readable id ("TES080") instead of
+// the opaque ObjectId, WITHOUT a DB hit on every 2-min ping (30 users
+// × 30 pings/hour = 900 reads/hour saved). Wiped on Render restart —
+// re-populates from the next ping per user, which is fine.
+const empIdCache = new Map();
+async function resolveEmployeeId(userId) {
+  if (!userId) return 'unknown';
+  const key = String(userId);
+  if (empIdCache.has(key)) return empIdCache.get(key);
+  try {
+    const u = await User.findById(key, { employeeId: 1 }).lean();
+    const eid = u?.employeeId || key.slice(-6).toUpperCase();
+    empIdCache.set(key, eid);
+    return eid;
+  } catch {
+    return key.slice(-6).toUpperCase();
+  }
+}
 
 /**
  * Resolve a department or designation reference to a human label.
@@ -104,7 +129,12 @@ function simplifyPolyline(points, minStepM = 10) {
  *   'none' — no usable coords on the day
  */
 async function buildDailyRoute(userId, dateIso, opts = {}) {
-  const empty = { distanceKm: 0, source: 'none', polyline: [], from: null, to: null };
+  const empty = {
+    distanceKm: 0, source: 'none', polyline: [], from: null, to: null,
+    // #380 — surface zero counts on empty routes too so the HRMS tile
+    // never falls back to reading polyline.length.
+    pingCount: 0, movingPings: 0, anchorPings: 0,
+  };
   if (!userId || !dateIso) return empty;
 
   // Optional time window — when computing for an Attendance row we trim
@@ -128,6 +158,25 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
     .select('lat lng recordedAt')
     .lean();
 
+  // #380 — Count ALL rows for this employee+date (moving + anchor)
+  // so the HRMS "PINGS" tile can show the true audit count instead of
+  // the simplified polyline length. For a straight highway drive, the
+  // polyline simplifier collapses 100+ colinear points down to ~10;
+  // that's correct for map rendering but HR needs to see the real
+  // capture volume to judge whether tracking was healthy.
+  const totalCountQ = { user: userId, date: dateIso };
+  if (opts.checkIn || opts.checkOut) {
+    totalCountQ.recordedAt = {};
+    if (opts.checkIn)  totalCountQ.recordedAt.$gte = new Date(opts.checkIn);
+    if (opts.checkOut) totalCountQ.recordedAt.$lte = new Date(opts.checkOut);
+    if (!Object.keys(totalCountQ.recordedAt).length) delete totalCountQ.recordedAt;
+  }
+  const [totalPings, anchorPings] = await Promise.all([
+    LocationPing.countDocuments(totalCountQ),
+    LocationPing.countDocuments({ ...totalCountQ, isAnchor: true }),
+  ]);
+  const movingPings = pings.length;
+
   if (pings.length >= 2) {
     // Sum the FULL ping list for accurate km — every micro-movement
     // counts toward distance even if we won't render it. Then SIMPLIFY
@@ -148,6 +197,12 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
       polyline:   compact,
       from:       { lat: first.lat, lng: first.lng, at: first.recordedAt },
       to:         { lat: last.lat,  lng: last.lng,  at: last.recordedAt  },
+      // #380 — Real counts. `pingCount` is the total audit rows for the
+      // day; movingPings + anchorPings breaks it down. The old
+      // polyline.length only reflected simplified vertices.
+      pingCount:   totalPings,
+      movingPings,
+      anchorPings,
     };
   }
 
@@ -275,6 +330,7 @@ exports.checkIn = async (req, res) => {
         user: req.user.id,
         date,
         checkIn: now,
+        checkInLocal: fmtIST(now),  // #404 IST cosmetic sidecar
         firstCheckIn: now,          // #336 snapshot for reports
         location,
         status,
@@ -292,6 +348,9 @@ exports.checkIn = async (req, res) => {
       //     sessions and their duration are already rolled up
       record.checkIn  = now;
       record.checkOut = null;                       // #336 reopen — "working"
+      // #404 — IST sidecars for the DB viewer.
+      record.checkInLocal  = fmtIST(now);
+      record.checkOutLocal = '';
       if (!record.firstCheckIn) record.firstCheckIn = now;
       record.location = location;
       record.status   = status;
@@ -317,15 +376,38 @@ exports.checkIn = async (req, res) => {
         lastLocation: { lat: checkInLat, lng: checkInLng, accuracy: accuracy ?? null, updatedAt: now },
       });
       try {
+        // #391 — bucket is now REQUIRED on LocationPing (schema change in
+        // #379) and forms part of the unique (user, date, bucket) index.
+        // Previously this insert omitted bucket, which meant:
+        //   (a) with bucket required, it would fail schema validation;
+        //   (b) with bucket optional, two check-in-time pings within 2
+        //       minutes of each other (e.g. re-check-in) would insert
+        //       twice with null buckets — one of the duplicate-source
+        //       patterns we're trying to eliminate.
+        // Compute the bucket + catch E11000 exactly like /location-ping
+        // does. If a location-ping already won this bucket (the mobile
+        // fires an immediate warm-up ping ~1 s after check-in returns),
+        // the duplicate is swallowed silently — the row already exists.
+        const _bucket = Math.floor(now.getTime() / 120000);
         await LocationPing.create({
           user: req.user.id,
           date,
           recordedAt: now,
+          recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
           lat: checkInLat, lng: checkInLng,
           accuracy: typeof accuracy === 'number' ? accuracy : null,
           presence: 'active',
+          bucket: _bucket,
         });
-      } catch (e) { console.warn('[checkIn] initial ping save failed:', e.message); }
+      } catch (e) {
+        if (e && e.code === 11000) {
+          // Duplicate bucket — a /location-ping from the mobile client
+          // won the same 2-min slot. That's intended behaviour: one row
+          // per bucket. Silent skip.
+        } else {
+          console.warn('[checkIn] initial ping save failed:', e.message);
+        }
+      }
     }
 
     res.json({ message: 'Checked in', record });
@@ -354,6 +436,7 @@ exports.checkOut = async (req, res) => {
     }
     const now = new Date();
     record.checkOut = now;
+    record.checkOutLocal = fmtIST(now);  // #404 IST cosmetic sidecar
     // ─── #336 Roll up session into accumulated total ────────────────
     // Compute THIS session's duration (checkIn → now), add it into the
     // running accumulatedSeconds, then derive workedHours from the
@@ -628,15 +711,30 @@ exports.checkOut = async (req, res) => {
       }
       await User.findByIdAndUpdate(req.user.id, userUpdate);
       if (checkOutLat != null && checkOutLng != null) {
-        await LocationPing.create({
-          user: req.user.id,
-          date,
-          recordedAt: now,
-          lat: checkOutLat,
-          lng: checkOutLng,
-          accuracy: typeof accuracy === 'number' ? accuracy : null,
-          presence: 'offline',
-        });
+        // #391 — bucket is REQUIRED on LocationPing. Same treatment as
+        // check-in above: compute the 2-min bucket and let the unique
+        // (user, date, bucket) index dedupe if a client-side /location-
+        // ping already claimed this slot.
+        const _bucket = Math.floor(now.getTime() / 120000);
+        try {
+          await LocationPing.create({
+            user: req.user.id,
+            date,
+            recordedAt: now,
+            recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
+            lat: checkOutLat,
+            lng: checkOutLng,
+            accuracy: typeof accuracy === 'number' ? accuracy : null,
+            presence: 'offline',
+            bucket: _bucket,
+          });
+        } catch (e) {
+          if (e && e.code === 11000) {
+            // duplicate bucket — client ping already recorded this slot
+          } else {
+            throw e;
+          }
+        }
       }
     } catch (e) {
       // Non-fatal — the attendance row is what matters; presence is best-effort.
@@ -736,26 +834,35 @@ exports.getMonthly = async (req, res) => {
     const records = await Attendance.find({
       user: req.user.id,
       date: { $gte: start, $lte: end },
-    });
+    }).lean();
 
-    const leaves = await Leave.find({ user: req.user.id });
-    const overlay = {};
-    leaves.forEach((l) => {
-      if (l.requestType === 'permission' && l.date) overlay[l.date] = 'permission';
-      if (l.requestType === 'leave' && l.startDate && l.endDate) {
-        const d = parseAnyDate(l.startDate);
-        if (d) {
-          const key = d.toISOString().split('T')[0];
-          if (key >= start && key <= end) overlay[key] = 'leave';
-        }
-      }
-    });
+    // #407 — Only fully-approved leaves + permissions overlay. Requires
+    // BOTH manager approval AND HR final approval.
+    const leaves = await Leave.find({
+      user: req.user.id,
+      status: 'approved',
+      managerStatus: 'Approved',
+      $or: [
+        { requestType: 'leave',      startDate: { $lte: end }, endDate: { $gte: start } },
+        { requestType: 'permission', date: { $gte: start, $lte: end } },
+      ],
+    }).lean();
 
-    const map = {};
-    records.forEach((r) => (map[r.date] = r.status));
-    Object.entries(overlay).forEach(([k, v]) => (map[k] = v));
+    // Attach a shim user so applyLeavePermissionOverlay's index by
+    // "userId|date" works without needing populate() on a self-scoped query.
+    const uidStr = String(req.user.id);
+    records.forEach(r => { if (!r.user) r.user = uidStr; });
+    const shimmedLeaves = leaves.map(l => ({ ...l, user: uidStr }));
 
-    const result = Object.entries(map).map(([date, status]) => ({ date, status }));
+    applyLeavePermissionOverlay(records, shimmedLeaves, { rangeStart: start, rangeEnd: end });
+
+    // Return only { date, status } to match the pre-#407 shape callers expect.
+    // #417 — Prefer hrOverrideStatus when hrOverride=true so HR's flip
+    // shows in the mobile calendar immediately (single source of truth).
+    const result = records.map(r => ({
+      date: r.date,
+      status: (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status,
+    }));
     res.json(result);
   } catch (err) {
     console.error('getMonthly error:', err);
@@ -779,20 +886,63 @@ exports.getCalendar = async (req, res) => {
       date: { $gte: start, $lte: end },
     }).lean();
 
+    // #407 — Overlay approved Leave/Permission onto calendar cells so
+    // ERM Mobile + ERM Web calendar shows Leave / Permission / Present /
+    // Absent consistently with HRMS. Requires BOTH manager AND HR approval.
+    try {
+      const leaves = await Leave.find({
+        user: req.user.id,
+        status: 'approved',
+        managerStatus: 'Approved',
+        $or: [
+          { requestType: 'leave',      startDate: { $lte: end }, endDate: { $gte: start } },
+          { requestType: 'permission', date: { $gte: start, $lte: end } },
+        ],
+      }).lean();
+      const uidStr = String(req.user.id);
+      records.forEach(r => { if (!r.user) r.user = uidStr; });
+      const shimmedLeaves = leaves.map(l => ({ ...l, user: uidStr }));
+      applyLeavePermissionOverlay(records, shimmedLeaves, { rangeStart: start, rangeEnd: end });
+    } catch (e) {
+      console.warn('[getCalendar] leave overlay failed:', e.message);
+    }
+
     res.json(
-      records.map((r) => ({
-        date: r.date,
-        status: r.status,
-        // #342 Multi-session: show day's first arrival on calendar
-        // click, not the latest resume. Fallback keeps pre-upgrade rows
-        // rendering unchanged.
-        checkIn: r.firstCheckIn || r.checkIn,
-        firstCheckIn: r.firstCheckIn || r.checkIn,
-        checkOut: r.checkOut,
-        workedHours: r.workedHours,
-        accumulatedSeconds: Number(r.accumulatedSeconds || 0),
-        sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
-      }))
+      records.map((r) => {
+        // #417 — HR override + workedHours safety net (same rules as
+        // getHistory). Ensures the mobile calendar shows the HR-flipped
+        // status and correct hours for auto-closed rows.
+        const effectiveStatus = (r.hrOverride === true && r.hrOverrideStatus)
+          ? r.hrOverrideStatus
+          : r.status;
+        let workedHours = Number(r.workedHours || 0);
+        const accSeconds = Number(r.accumulatedSeconds || 0);
+        if (workedHours <= 0 && accSeconds > 0) {
+          workedHours = Math.round((accSeconds / 3600) * 100) / 100;
+        }
+        if (workedHours <= 0 && r.checkIn && r.checkOut) {
+          const inMs  = new Date(r.checkIn).getTime();
+          const outMs = new Date(r.checkOut).getTime();
+          if (Number.isFinite(inMs) && Number.isFinite(outMs) && outMs > inMs) {
+            const secs = Math.min(24 * 3600, Math.round((outMs - inMs) / 1000));
+            workedHours = Math.round((secs / 3600) * 100) / 100;
+          }
+        }
+        return {
+          date: r.date,
+          status: effectiveStatus,
+          hrOverride: !!r.hrOverride,
+          // #342 Multi-session: show day's first arrival on calendar
+          // click, not the latest resume. Fallback keeps pre-upgrade rows
+          // rendering unchanged.
+          checkIn: r.firstCheckIn || r.checkIn,
+          firstCheckIn: r.firstCheckIn || r.checkIn,
+          checkOut: r.checkOut,
+          workedHours,
+          accumulatedSeconds: accSeconds,
+          sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
+        };
+      })
     );
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -917,24 +1067,56 @@ exports.getHistory = async (req, res) => {
       .lean();
 
     res.json(
-      records.map((r) => ({
-        _id: r._id,
-        date: r.date,
-        status: r.status,
-        // #342 — expose firstCheckIn so the client can display the
-        // day's first arrival. Fallback to checkIn for rows created
-        // before the multi-session upgrade.
-        checkIn: r.firstCheckIn || r.checkIn,
-        firstCheckIn: r.firstCheckIn || r.checkIn,
-        // checkOut = last session end for the day.
-        checkOut: r.checkOut,
-        // workedHours reflects accumulatedSeconds / 3600 (multi-session sum).
-        workedHours: r.workedHours,
-        accumulatedSeconds: Number(r.accumulatedSeconds || 0),
-        sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
-        location: r.location,
-        shift: r.shift || 'General Shift',
-      }))
+      records.map((r) => {
+        // #417 — HR OVERWRITE PROPAGATION.
+        // If HR flipped the row via /admin/mark-status, hrOverride is
+        // true and hrOverrideStatus holds the authoritative value. The
+        // record's `.status` field is already updated by that path, but
+        // we return `hrOverrideStatus` explicitly as a belt-and-braces
+        // safeguard so downstream re-derivation (dashboards, reports)
+        // can't accidentally undo HR's decision.
+        const effectiveStatus = (r.hrOverride === true && r.hrOverrideStatus)
+          ? r.hrOverrideStatus
+          : r.status;
+        // #417 — Display-side workedHours safety net. Legacy rows and
+        // rows closed by pre-#417 autoCloseAttendance could have
+        // workedHours=0 even though checkIn+checkOut both exist. If
+        // that's the case, compute the elapsed hours on the fly so
+        // ERM Mobile/Web history stops showing "00:00" for a day the
+        // employee clearly worked.
+        let workedHours = Number(r.workedHours || 0);
+        const accSeconds = Number(r.accumulatedSeconds || 0);
+        if (workedHours <= 0 && accSeconds > 0) {
+          workedHours = Math.round((accSeconds / 3600) * 100) / 100;
+        }
+        if (workedHours <= 0 && r.checkIn && r.checkOut) {
+          const inMs  = new Date(r.checkIn).getTime();
+          const outMs = new Date(r.checkOut).getTime();
+          if (Number.isFinite(inMs) && Number.isFinite(outMs) && outMs > inMs) {
+            const secs = Math.min(24 * 3600, Math.round((outMs - inMs) / 1000));
+            workedHours = Math.round((secs / 3600) * 100) / 100;
+          }
+        }
+        return {
+          _id: r._id,
+          date: r.date,
+          status: effectiveStatus,
+          hrOverride: !!r.hrOverride,          // let clients render an "HR" chip if they want
+          // #342 — expose firstCheckIn so the client can display the
+          // day's first arrival. Fallback to checkIn for rows created
+          // before the multi-session upgrade.
+          checkIn: r.firstCheckIn || r.checkIn,
+          firstCheckIn: r.firstCheckIn || r.checkIn,
+          // checkOut = last session end for the day.
+          checkOut: r.checkOut,
+          // workedHours reflects accumulatedSeconds / 3600 (multi-session sum).
+          workedHours,
+          accumulatedSeconds: accSeconds,
+          sessionCount: Array.isArray(r.sessions) ? r.sessions.length : 0,
+          location: r.location,
+          shift: r.shift || 'General Shift',
+        };
+      })
     );
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -1180,11 +1362,55 @@ exports.adminMarkStatus = async (req, res) => {
       return res.status(400).json({ message: 'userId or employeeId is required' });
     }
 
-    const record = await Attendance.findOne({ user: userRef, date });
-    if (!record) return res.status(404).json({ message: `No attendance row for ${date}` });
-
-    const previous = record.status;
-    record.status = status;
+    // #386 — Upsert so HR can Mark Present even for a user who has no
+    // attendance row yet for the date (e.g. auto-close cron hasn't run
+    // or employee never checked in). Previously we 404'd on missing
+    // rows, which made the Mark Present button appear to do nothing
+    // for anyone who never touched the app that day.
+    let record = await Attendance.findOne({ user: userRef, date });
+    let previous;
+    if (!record) {
+      previous = 'none';
+      record = new Attendance({
+        user: userRef,
+        date,
+        status,
+        checkIn: null,
+        checkOut: null,
+      });
+    } else {
+      previous = record.status;
+      record.status = status;
+    }
+    // #388 — ALWAYS stamp hrOverride so downstream code paths know this
+    // status was set by HR, not derived from check-in time. Without
+    // this, adminListAll re-derives status on every response and flips
+    // the row back to "absent" within seconds of HR clicking Mark
+    // Present (observed for TES080/TES030 whose check-in was after
+    // 10:30 AM). The reclassify loop now honours this flag.
+    record.hrOverride       = true;
+    record.hrOverrideStatus = status;
+    record.hrOverrideNote   = note || record.hrOverrideNote || '';
+    // #417 — If the row has checkIn+checkOut but workedHours was left at
+    // 0 (autoCloseAttendance legacy rows, or a manual DB fixup), compute
+    // hours on-the-fly so the mobile/web history stops showing "00:00"
+    // right after HR flips the status. This is a one-way heal: we never
+    // overwrite a positive workedHours value HR might have set manually.
+    try {
+      const cur = Number(record.workedHours || 0);
+      if (cur <= 0 && record.checkIn && record.checkOut) {
+        const inMs  = new Date(record.checkIn).getTime();
+        const outMs = new Date(record.checkOut).getTime();
+        if (Number.isFinite(inMs) && Number.isFinite(outMs) && outMs > inMs) {
+          const sessionSeconds = Math.min(24 * 3600, Math.round((outMs - inMs) / 1000));
+          record.accumulatedSeconds = Math.max(record.accumulatedSeconds || 0, sessionSeconds);
+          record.workedHours = Math.round((record.accumulatedSeconds / 3600) * 100) / 100;
+        }
+      }
+    } catch (e) {
+      console.warn('[adminMarkStatus] workedHours backfill failed:', e.message);
+    }
+    record.hrOverrideAt     = new Date();
     // When we flip AWAY from halfday/absent, clear the LOP flag so the
     // leavePolicy tallies get updated correctly on next read.
     if (status !== 'halfday' && status !== 'absent') {
@@ -1237,6 +1463,22 @@ function parseAnyDate(s) {
 exports.locationPing = async (req, res) => {
   try {
     const { lat, lng, accuracy, speed, recordedAt, isStationary } = req.body || {};
+
+    // #397 — Log every incoming ping with the employee id (TES080,
+    // TES047, etc.) — useful for tailing Render logs to see which
+    // employees are actually delivering pings and which are silent.
+    // Fires BEFORE any validation so even malformed pings show up
+    // (helps diagnose "why is TES080 offline"). The employee id is
+    // resolved via an in-memory cache so we don't hit MongoDB on
+    // every 2-min ping.
+    try {
+      const empId = await resolveEmployeeId(req.user?.id);
+      console.log('[locationPing]', empId, {
+        lat, lng, accuracy,
+        recordedAt: recordedAt || new Date().toISOString(),
+      });
+    } catch (_logErr) { /* logging must never break the request */ }
+
     if (typeof lat !== 'number' || typeof lng !== 'number' || !isFinite(lat) || !isFinite(lng)) {
       return res.status(400).json({ message: 'Provide numeric lat and lng.' });
     }
@@ -1311,44 +1553,68 @@ exports.locationPing = async (req, res) => {
     // correctly — HR mistook the gaps for tracking failures.
     // The row still goes through the 100-sec dedup gate below.
 
-    // #373 — DEDUPE WINDOW: 100 seconds.
-    // Target cadence is 1 ping every 120 s (mobile OS task interval).
-    // Anything arriving < 100 s after the previous accepted row is
-    // treated as a burst / duplicate / replay — presence + lastLocation
-    // are still updated (freshness clock stays current) but the audit
-    // row insert is skipped. The 20-s safety margin below 120 s covers
-    // normal OS delivery jitter without dropping a real scheduled tick.
-    const lastPing = await LocationPing
-      .findOne({ user: req.user.id, date })
-      .sort({ recordedAt: -1 })
-      .select('recordedAt')
-      .lean();
-    if (lastPing) {
-      const gapSec = (now.getTime() - new Date(lastPing.recordedAt).getTime()) / 1000;
-      if (gapSec < 100) {
+    // #379 — ATOMIC DEDUP via unique index on (user, date, bucket).
+    // Bucket = floor(recordedAt_ms / 120000) → one slot per 2-min window.
+    // Previous approach was a read-then-write race: 3 concurrent requests
+    // all read the same lastPing, all saw the gap > 100 s, all inserted
+    // (observed for TES080: 3 rows within 69 ms after a 20-min bg-task
+    // outage fired multiple recovery pings at once).
+    //
+    // Now LocationPing.create() attempts the insert; if another request
+    // already won this bucket, MongoDB throws E11000 and we return a
+    // clean "duplicate" response. No race is possible — the DB itself
+    // serialises writes on the unique index.
+    const bucket = Math.floor(now.getTime() / 120000);
+
+    try {
+      await LocationPing.create({
+        user: req.user.id,
+        date,
+        recordedAt: now,
+        recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
+        lat, lng,
+        accuracy: accNum,
+        speed:    typeof speed    === 'number' ? speed    : null,
+        presence: 'active',
+        // #375 — flag anchor-echo rows so distance / polyline queries can
+        // filter them via { isAnchor: { $ne: true } }.
+        isAnchor: stationary,
+        // #379 — bucket key for the atomic dedup index above.
+        bucket,
+      });
+    } catch (err) {
+      // #403 — BROAD DUPLICATE-KEY DETECTION.
+      // Mongoose 7+ wraps insert errors as MongoServerError; some code
+      // paths surface as MongoBulkWriteError with the code buried in
+      // writeErrors[0]. Historically we only checked err.code === 11000
+      // which missed both. Result: legitimate dup-key events bubbled
+      // up to the outer catch and returned HTTP 500, which the mobile
+      // client interpreted as "server down" — its burst guard rolled
+      // back and immediately retried, hitting the same E11000 on the
+      // orphaned null-bucket row, in a tight loop.
+      //
+      // Now we treat ANY of these as "already recorded — return 200":
+      //   • err.code === 11000
+      //   • err.name === 'MongoServerError' with code 11000
+      //   • err.writeErrors[0].code === 11000
+      //   • err.message contains "E11000" or "duplicate key"
+      const isDupKey =
+        (err && err.code === 11000) ||
+        (err && err.name === 'MongoServerError' && err.code === 11000) ||
+        (err && Array.isArray(err.writeErrors) && err.writeErrors.some(w => w?.code === 11000)) ||
+        (err && typeof err.message === 'string' && /E11000|duplicate key/i.test(err.message));
+      if (isDupKey) {
         return res.json({
           ok: true,
           accepted: false,
-          reason: 'duplicate-within-100s',
-          lastPingAgeSec: Math.round(gapSec),
+          reason: 'duplicate-bucket',
+          bucket,
         });
       }
+      throw err;
     }
 
-    await LocationPing.create({
-      user: req.user.id,
-      date,
-      recordedAt: now,
-      lat, lng,
-      accuracy: accNum,
-      speed:    typeof speed    === 'number' ? speed    : null,
-      presence: 'active',
-      // #375 — flag anchor-echo rows so distance / polyline queries can
-      // filter them via { isAnchor: { $ne: true } }.
-      isAnchor: stationary,
-    });
-
-    res.json({ ok: true, stationary });
+    res.json({ ok: true, stationary, bucket });
   } catch (err) {
     console.error('locationPing error:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -1375,6 +1641,18 @@ exports.setPresence = async (req, res) => {
       presence: state,
       lastSeenAt: new Date(),
     });
+
+    // #408 — Log every presence push with the human employee ID so HR
+    // can watch the Render logs and see who is currently active / idle /
+    // offline in real time. Uses the same empIdCache as #397 so no extra
+    // DB read on repeat calls.
+    try {
+      const empId = await resolveEmployeeId(req.user.id);
+      console.log(`[presence] ${empId} → ${state} @ ${fmtIST(new Date())}`);
+    } catch (e) {
+      console.log(`[presence] <unresolved-user> → ${state}`);
+    }
+
     res.json({ ok: true, state });
   } catch (err) {
     console.error('setPresence error:', err);
@@ -1410,6 +1688,7 @@ exports.autoCheckOut = async (req, res) => {
     );
     record.accumulatedSeconds = Math.max(0, (record.accumulatedSeconds || 0) + sessionSeconds);
     record.checkOut       = now;
+    record.checkOutLocal  = fmtIST(now);  // #404 IST cosmetic sidecar
     record.workedHours    = Math.round((record.accumulatedSeconds / 3600) * 100) / 100;
     record.autoCheckedOut = true;
     if (!Array.isArray(record.sessions)) record.sessions = [];
@@ -1515,6 +1794,13 @@ exports.adminListAll = async (req, res) => {
     };
     for (const a of items) {
       if (!a.checkIn) continue;
+      // #388 — HR MANUAL OVERRIDE takes precedence. Rows with
+      // hrOverride=true were explicitly set by HR via /admin/mark-status
+      // (Mark Present button) and MUST NOT be re-derived from check-in
+      // time. Before this guard, a Present row for a 12:04 PM check-in
+      // was flipped back to Absent on the very next HRMS refresh
+      // because the re-derivation below saw check-in > 10:30 AM.
+      if (a.hrOverride === true) continue;
       // #352a — Only override present/late/absent based on arrival time.
       // Leave / permission / halfday rows keep their own status because:
       //   • permission = manager approved a late-arrival regularisation
@@ -1538,21 +1824,25 @@ exports.adminListAll = async (req, res) => {
       }
     }
 
-    // ─── Overlay approved leaves + permissions onto the day(s) ────────
-    // An employee on approved Leave / Permission for a day still needs to
-    // appear on HRMS Attendance Logs even when they never tapped Check-In
-    // (which is the usual case for full leave days). We synthesize a
-    // pseudo-attendance row for each leave/permission covering the queried
-    // day(s) and merge it into the response if no real attendance row
-    // exists for that user + date.
+    // ─── #407 Overlay approved Leave / Permission onto the day(s) ─────
+    // Rules (from HR spec, Jul 2026):
+    //   • Overlay fires ONLY when BOTH tiers approved:
+    //       managerStatus === 'Approved'  AND  status === 'approved'
+    //     (a manager-only or HR-only approval is not enough).
+    //   • Approved LEAVE → date(s) forced to 'leave'.
+    //   • Approved PERMISSION:
+    //       – NOW is inside the window            → 'permission'
+    //       – NOW is past the window + checked in → 'present' (excused lateness)
+    //       – NOW is past the window + no checkIn → 'absent'
+    //   • HR manual override (`hrOverride: true`) still wins over auto overlay.
+    //   • Employees with no attendance row at all get a synthetic row so
+    //     they appear on HR's Attendance Logs.
     try {
-      const seen = new Set(items.map(a => String(a.user?._id || a.user) + '|' + a.date));
       const leaves = await Leave.find({
         status: 'approved',
+        managerStatus: 'Approved',
         $or: [
-          // Leave whose [startDate, endDate] window overlaps the range.
           { requestType: 'leave',      startDate: { $lte: rangeEnd }, endDate: { $gte: rangeStart } },
-          // Permission whose single `date` falls inside the range.
           { requestType: 'permission', date: { $gte: rangeStart, $lte: rangeEnd } },
         ],
       })
@@ -1560,45 +1850,7 @@ exports.adminListAll = async (req, res) => {
         .limit(limit)
         .lean();
 
-      const overlay = [];
-      for (const lv of leaves) {
-        if (!lv.user) continue;
-        // Build the set of dates this leave covers inside the query range.
-        const dates = [];
-        if (lv.requestType === 'permission') {
-          if (lv.date && lv.date >= rangeStart && lv.date <= rangeEnd) dates.push(lv.date);
-        } else {
-          // Walk start..end day-by-day and add every covered date that
-          // also intersects the queried range.
-          const s = new Date(Math.max(new Date(lv.startDate || rangeStart), new Date(rangeStart)));
-          const e = new Date(Math.min(new Date(lv.endDate   || rangeStart), new Date(rangeEnd)));
-          for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-            dates.push(d.toISOString().slice(0, 10));
-          }
-        }
-        for (const date of dates) {
-          const key = String(lv.user._id) + '|' + date;
-          if (seen.has(key)) continue;        // real attendance row wins
-          seen.add(key);
-          overlay.push({
-            _id:    'lv-' + lv._id + '-' + date,
-            user:   lv.user,
-            date,
-            status: lv.requestType === 'permission' ? 'permission' : 'leave',
-            checkIn:  null,
-            checkOut: null,
-            // Permission carries the time-of-day window; full-day leave does not.
-            startTime: lv.startTime || null,
-            endTime:   lv.endTime   || null,
-            durationHours: lv.durationHours || null,
-            // Flag so the HRMS UI can distinguish overlayed rows if it wants.
-            isOverlay: true,
-            leaveType: lv.leaveType || lv.permissionType || '',
-            reason:    lv.reason    || '',
-          });
-        }
-      }
-      items.push(...overlay);
+      applyLeavePermissionOverlay(items, leaves, { rangeStart, rangeEnd });
     } catch (e) {
       console.warn('[attendance.adminListAll] leave overlay failed:', e.message);
     }
@@ -2322,5 +2574,184 @@ exports.adminPingAnalytics = async (req, res) => {
   } catch (err) {
     console.error('adminPingAnalytics error:', err);
     res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * #416 — POST /api/attendance/location-pings/missing-pings   (JWT)
+ *
+ * Body: { pings: [{ employeeId, date, localTime, latitude, longitude,
+ *                    accuracy?, speed?, isStationary?, bucket? }, …] }
+ *
+ * SQLite-as-source-of-truth reconciliation endpoint. The client reads every
+ * ping still marked `pending` in local SQLite (plus optionally recently
+ * `synced` rows within a 24-hour window if HR wants a full re-audit) and
+ * ships them here in one batch.
+ *
+ * Server behaviour:
+ *   1. Resolve the calling user (JWT). All pings in the batch are stamped
+ *      against THIS user regardless of what `employeeId` the client sends
+ *      — prevents cross-user injection.
+ *   2. Sort the batch by (date, localTime) ascending — chronological
+ *      order is required for HR polylines to render correctly.
+ *   3. For each row, compute the 2-min `bucket` (floor(recordedAt/120000))
+ *      from `date + localTime` if the client didn't send one. This is the
+ *      SAME bucket the realtime /location-ping endpoint uses, so it
+ *      participates in the SAME MongoDB partial unique index
+ *      `{ user, date, bucket }` — atomic dedup at write time.
+ *   4. Attempt to insertMany with `ordered: false` so a duplicate on one
+ *      row doesn't abort the batch. MongoDB reports each duplicate as an
+ *      individual writeError with code 11000; we count them as `existed`.
+ *   5. Return a structured summary the client uses to decide which rows
+ *      to mark synced locally.
+ *
+ * Response:
+ *   {
+ *     success:            true,
+ *     totalReceived:      <int>,   // pings the client sent
+ *     alreadyExisted:     <int>,   // matched dedup index, no insert
+ *     inserted:           <int>,   // net-new rows written to DB
+ *     duplicatesSkipped:  <int>,   // same as alreadyExisted, HR-friendly alias
+ *     insertedBuckets:    <int[]>, // buckets the client can safely mark synced
+ *     existedBuckets:     <int[]>, // also safe to mark synced (server has them)
+ *     status:             'Success' | 'Failed',
+ *   }
+ *
+ * IDEMPOTENCY: because dedup is enforced by the DB partial unique index on
+ * (user, date, bucket), calling this endpoint 100 times with the same batch
+ * inserts each row exactly once. The counts on subsequent calls will show
+ * everything as `alreadyExisted`.
+ */
+exports.syncMissingPings = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Not authenticated' });
+
+    const raw = Array.isArray(req.body?.pings) ? req.body.pings : [];
+    if (raw.length === 0) {
+      return res.json({
+        success: true,
+        totalReceived:     0,
+        alreadyExisted:    0,
+        inserted:          0,
+        duplicatesSkipped: 0,
+        insertedBuckets:   [],
+        existedBuckets:    [],
+        status: 'Success',
+      });
+    }
+
+    // Resolve employeeId once per user to stamp the sidecar column.
+    const empId = await resolveEmployeeId(userId);
+
+    // ─── Step 1: parse + validate + compute bucket for every row ─────
+    // Client sends `date` as YYYY-MM-DD and `localTime` as HH:mm:ss (IST).
+    // We reconstruct the UTC recordedAt from those two so the DB
+    // recordedAt matches what the realtime path would have stored, and
+    // we compute the atomic 2-min bucket the same way (#379/#403).
+    const LocationPing = require('../models/LocationPing');
+    const parsed = [];
+    for (const p of raw) {
+      const date = String(p?.date || '').trim();
+      const localTime = String(p?.localTime || '').trim();
+      const lat = Number(p?.latitude ?? p?.lat);
+      const lng = Number(p?.longitude ?? p?.lng);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (!/^\d{2}:\d{2}(:\d{2})?$/.test(localTime)) continue;
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      const hhmmss = localTime.length === 5 ? `${localTime}:00` : localTime;
+      const recordedAt = new Date(`${date}T${hhmmss}+05:30`);
+      if (isNaN(recordedAt.getTime())) continue;
+      const bucket = Math.floor(recordedAt.getTime() / 120000);
+      parsed.push({
+        user: userId,
+        employeeId: empId,
+        date,
+        recordedAt,
+        recordedAtLocal: fmtIST(recordedAt),
+        lat, lng,
+        accuracy:     Number.isFinite(Number(p?.accuracy))     ? Number(p.accuracy)     : null,
+        speed:        Number.isFinite(Number(p?.speed))        ? Number(p.speed)        : null,
+        isStationary: p?.isStationary === true,
+        bucket,
+        presence: 'active',
+      });
+    }
+
+    // ─── Step 2: chronological order (oldest → newest) ────────────────
+    parsed.sort((a, b) => a.recordedAt.getTime() - b.recordedAt.getTime());
+
+    console.log(`[missing-pings] ${empId} batch received=${raw.length} parsed=${parsed.length}`);
+
+    if (parsed.length === 0) {
+      return res.json({
+        success: true,
+        totalReceived: raw.length,
+        alreadyExisted: 0,
+        inserted: 0,
+        duplicatesSkipped: 0,
+        insertedBuckets: [],
+        existedBuckets: [],
+        status: 'Success',
+      });
+    }
+
+    // ─── Step 3: bulk insert with ordered:false so E11000 on one row
+    //             doesn't abort the whole batch.
+    let inserted = 0;
+    let existed  = 0;
+    const insertedBuckets = [];
+    const existedBuckets  = [];
+
+    try {
+      const result = await LocationPing.insertMany(parsed, {
+        ordered: false,
+        rawResult: true,
+      });
+      inserted = result.insertedCount || parsed.length;
+      parsed.forEach(p => insertedBuckets.push(p.bucket));
+    } catch (err) {
+      const writeErrors = err?.writeErrors || err?.result?.result?.writeErrors || [];
+      const okCount     = err?.result?.result?.nInserted
+                       ?? err?.insertedDocs?.length
+                       ?? (parsed.length - writeErrors.length);
+      inserted = Number(okCount) || 0;
+      for (const we of writeErrors) {
+        const isDup = we?.code === 11000 || /E11000|duplicate key/i.test(String(we?.errmsg || we?.message || ''));
+        const idx = typeof we?.index === 'number' ? we.index : null;
+        const row = (idx != null && parsed[idx]) ? parsed[idx] : null;
+        if (isDup) {
+          existed += 1;
+          if (row) existedBuckets.push(row.bucket);
+        } else {
+          console.warn('[missing-pings] non-dup write error:', we?.errmsg || we?.message);
+        }
+      }
+      const errIdx = new Set(writeErrors.map(w => w?.index).filter(i => typeof i === 'number'));
+      parsed.forEach((p, i) => { if (!errIdx.has(i)) insertedBuckets.push(p.bucket); });
+    }
+
+    console.log(
+      `[missing-pings] ${empId} DONE received=${raw.length} parsed=${parsed.length} ` +
+      `inserted=${inserted} existed=${existed} status=Success`
+    );
+
+    return res.json({
+      success:            true,
+      totalReceived:      raw.length,
+      alreadyExisted:     existed,
+      inserted,
+      duplicatesSkipped:  existed,
+      insertedBuckets,
+      existedBuckets,
+      status:             'Success',
+    });
+  } catch (err) {
+    console.error('[missing-pings] fatal:', err.message);
+    return res.status(500).json({
+      success: false,
+      status:  'Failed',
+      message: err.message || 'Server error',
+    });
   }
 };

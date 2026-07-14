@@ -26,6 +26,7 @@ const {
   adminPingAnalytics,
   lockOfficeAnchor,
   getLockedOfficeAnchor,
+  syncMissingPings,
 } = require('../controllers/attendanceController');
 
 router.post ('/checkin',       auth, checkIn);
@@ -41,6 +42,10 @@ router.patch('/mark',          auth, markStatus);
 
 // ─── Live tracking ────────────────────────────────────────────────
 router.post ('/location-ping', auth, locationPing);     // every 2 min while checked in
+// #416 — SQLite-as-source-of-truth batch sync. Client uploads every locally
+// stored ping still pending; server dedups by (employeeId + date + localTime)
+// and inserts only the missing ones in chronological order.
+router.post ('/location-pings/missing-pings', auth, syncMissingPings);
 router.post ('/presence',      auth, setPresence);      // active | idle | offline
 router.post ('/auto-checkout', auth, autoCheckOut);     // fires when GPS off mid-day
 router.get  ('/ping-history',  auth, pingHistory);      // HR / audit view

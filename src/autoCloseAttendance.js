@@ -70,6 +70,35 @@ async function sweepOnce() {
       row.status   = 'absent';
       row.autoClosed = true;
       row.autoClosedAt = new Date();
+      // #417 — Compute workedHours from (checkIn → 23:59). Previously
+      // this handler left workedHours at 0, so ERM Mobile/Web showed
+      // "Working HR's 00:00" even on days where the employee had a
+      // check-in and worked 8-12 hours before forgetting to check out.
+      // Now the row carries the actual elapsed time (capped at 24 h
+      // as a sanity guard).
+      try {
+        const inMs  = new Date(row.checkIn).getTime();
+        const outMs = closeStamp.getTime();
+        if (Number.isFinite(inMs) && Number.isFinite(outMs) && outMs > inMs) {
+          const sessionSeconds = Math.min(24 * 3600, Math.max(0, Math.round((outMs - inMs) / 1000)));
+          row.accumulatedSeconds = Math.max(0, (row.accumulatedSeconds || 0) + sessionSeconds);
+          row.workedHours = Math.round((row.accumulatedSeconds / 3600) * 100) / 100;
+          if (!Array.isArray(row.sessions)) row.sessions = [];
+          if (row.sessions.length === 0 || row.sessions[row.sessions.length - 1].checkOut !== closeStamp) {
+            row.sessions.push({
+              checkIn:  row.checkIn,
+              checkOut: closeStamp,
+              checkInLat:  row.checkInLat  ?? null,
+              checkInLng:  row.checkInLng  ?? null,
+              checkOutLat: null,
+              checkOutLng: null,
+              durationSeconds: sessionSeconds,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('[autoCloseAttendance] workedHours calc failed:', e.message);
+      }
       try {
         await row.save();
         closed++;
