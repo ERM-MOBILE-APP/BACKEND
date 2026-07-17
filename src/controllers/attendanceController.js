@@ -391,6 +391,7 @@ exports.checkIn = async (req, res) => {
         const _bucket = Math.floor(now.getTime() / 120000);
         await LocationPing.create({
           user: req.user.id,
+          employeeId: (await resolveEmployeeId(req.user.id)) || '',  // #434
           date,
           recordedAt: now,
           recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
@@ -488,23 +489,30 @@ exports.checkOut = async (req, res) => {
     const isHalfDay = workedHoursForPolicy < HALFDAY_THRESHOLD_HOURS;
 
     if (isHalfDay) {
-      let hasPermissionRequest = false;
+      // #425 — TIGHTENED "Permission" gate. Previously any non-rejected
+      // request (including pending / manager-only / HR-only) was enough to
+      // flip the day to 'permission' — inflating the Permission Count on
+      // the summary card. The rule is now: BOTH Manager AND HR must have
+      // approved. Anything short of that leaves the day as halfday LOP,
+      // matching the calendar's applyLeavePermissionOverlay behaviour.
+      let fullyApprovedPermission = false;
       try {
         const perm = await Leave.findOne({
           user: req.user.id,
           requestType: 'permission',
           date,
-          status: { $in: ['pending', 'approved'] }, // any non-rejected request
+          managerStatus: 'Approved',   // Manager tier
+          status: 'approved',          // HR tier
         }).lean();
-        hasPermissionRequest = !!perm;
+        fullyApprovedPermission = !!perm;
       } catch { /* fall through and treat as no permission */ }
 
-      if (hasPermissionRequest) {
-        // Permission filed (any non-rejected state) — show as Permission.
+      if (fullyApprovedPermission) {
+        // Both approvals in place — show as Permission.
         record.status = 'permission';
         record.earlyCheckoutLop = false;
       } else {
-        // No permission filed → half-day LOP.
+        // Pending / manager-only / HR-only / rejected → half-day LOP.
         record.status = 'halfday';
         record.earlyCheckoutLop = true;
       }
@@ -719,6 +727,7 @@ exports.checkOut = async (req, res) => {
         try {
           await LocationPing.create({
             user: req.user.id,
+            employeeId: (await resolveEmployeeId(req.user.id)) || '',  // #434
             date,
             recordedAt: now,
             recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
@@ -991,6 +1000,33 @@ exports.getSummary = async (req, res) => {
       date: { $gte: start, $lte: end },
     }).lean();
 
+    // #425 — Apply the same fully-approved leave/permission overlay used
+    // by getMonthly / getCalendar BEFORE counting. Without this, the
+    // Attendance Summary reported Late + Permission counts that didn't
+    // match the calendar view:
+    //   • Days marked 'late' at check-in but subsequently regularised by
+    //     an approved permission were still counted as Late.
+    //   • Approved-manager-only or approved-HR-only permissions were
+    //     leaking through into Permission (see #407 for the overlay's
+    //     strict "manager AND HR both approved" precondition — encoded
+    //     directly in the Leave.find predicate below).
+    // The overlay flips r.status to 'permission' (or 'leave') only for
+    // days that a fully-approved request covers, so the count loop
+    // afterwards trivially inherits the correct semantics.
+    const leaves = await Leave.find({
+      user: req.user.id,
+      status: 'approved',              // HR final approval
+      managerStatus: 'Approved',       // Manager approval
+      $or: [
+        { requestType: 'leave',      startDate: { $lte: end }, endDate: { $gte: start } },
+        { requestType: 'permission', date: { $gte: start, $lte: end } },
+      ],
+    }).lean();
+    const uidStr = String(req.user.id);
+    records.forEach(r => { if (!r.user) r.user = uidStr; });
+    const shimmedLeaves = leaves.map(l => ({ ...l, user: uidStr }));
+    applyLeavePermissionOverlay(records, shimmedLeaves, { rangeStart: start, rangeEnd: end });
+
     const summary = {
       present: 0,
       absent: 0,
@@ -1002,7 +1038,11 @@ exports.getSummary = async (req, res) => {
       totalDays: records.length,
     };
     records.forEach((r) => {
-      if (summary[r.status] !== undefined) summary[r.status] += 1;
+      // #417 — HR override wins over derived status.
+      const effective = (r.hrOverride === true && r.hrOverrideStatus)
+        ? r.hrOverrideStatus
+        : r.status;
+      if (summary[effective] !== undefined) summary[effective] += 1;
     });
 
     // Walk the month: classify each day as workday / weekly-off / holiday.
@@ -1569,6 +1609,11 @@ exports.locationPing = async (req, res) => {
     try {
       await LocationPing.create({
         user: req.user.id,
+        // #434 — Stamp the human employee id (TES080) so HR queries that
+        // filter by employeeId find realtime pings too. Previously only the
+        // batch endpoint set this, so live pings were saved with employeeId=''
+        // and a find({employeeId:'TES080'}) silently missed them.
+        employeeId: (await resolveEmployeeId(req.user.id)) || '',
         date,
         recordedAt: now,
         recordedAtLocal: fmtIST(now),  // #404 IST cosmetic sidecar
@@ -2268,16 +2313,42 @@ exports.adminDailyRoute = async (req, res) => {
       return res.status(404).json({ message: 'Employee not found' });
     }
 
-    // Pull every ping for the day, ordered chronologically. We trust the
-    // anti-jitter filter on the mobile side to have suppressed stationary
-    // points — every row here represents real motion.
-    const pings = await LocationPing.find({ user: user._id, date })
+    // #426 — Skip stationary "anchor" pings. Prior to this, the query
+    // pulled every LocationPing including the anchor-echoes the mobile
+    // client emits every 2 min while the employee is standing still
+    // (see LocationPing.js `isAnchor` field). Those all share the same
+    // lat/lng by design → sum of consecutive-pair haversines = 0, so the
+    // Daily Routes distance column showed "0.00 km · map polyline" even
+    // when the polyline had dozens of points. Filtering anchors out
+    // leaves only real-motion pings for the distance calc, matching
+    // what buildDailyRoute() does for the list endpoint.
+    //
+    // #426 — Also trim to (checkIn, checkOut) window when both are known
+    // so pings from before check-in / after check-out don't inflate the
+    // route or add ghost distance from earlier/later positions.
+    const attendance = await Attendance.findOne({ user: user._id, date }).lean();
+    const pingQuery = {
+      user: user._id,
+      date,
+      isAnchor: { $ne: true },   // #426 — strip stationary anchors
+    };
+    if (attendance?.checkIn) {
+      pingQuery.recordedAt = { $gte: new Date(attendance.checkIn) };
+      if (attendance?.checkOut) {
+        pingQuery.recordedAt.$lte = new Date(attendance.checkOut);
+      }
+    }
+    const pings = await LocationPing.find(pingQuery)
       .sort({ recordedAt: 1 })
       .select('lat lng recordedAt accuracy speed')
       .lean();
 
     // Total km via Haversine along consecutive points. Matches the
     // formula used by the petrol auto-bill so the two stay in sync.
+    // #426 — Also drop legs < 5 m (residual GPS jitter) and legs > 50 km
+    // (single-tick teleports that indicate a bad fix). This matches the
+    // frontend polylineKm() thresholds so both sides converge on the same
+    // number when the client re-derives from the returned polyline.
     const distMeters = (a, b) => {
       const R = 6371000;
       const toRad = d => d * Math.PI / 180;
@@ -2287,9 +2358,12 @@ exports.adminDailyRoute = async (req, res) => {
                 Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
       return 2 * R * Math.asin(Math.sqrt(s));
     };
+    const MIN_LEG_M = 5;
+    const MAX_LEG_M = 50_000;
     let totalM = 0;
     for (let i = 1; i < pings.length; i++) {
-      totalM += distMeters(pings[i - 1], pings[i]);
+      const legM = distMeters(pings[i - 1], pings[i]);
+      if (legM >= MIN_LEG_M && legM < MAX_LEG_M) totalM += legM;
     }
     const route = pings.map(p => ({ lat: p.lat, lng: p.lng, t: p.recordedAt }));
     const fullName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim() || 'Unknown';
@@ -2675,6 +2749,10 @@ exports.syncMissingPings = async (req, res) => {
         isStationary: p?.isStationary === true,
         bucket,
         presence: 'active',
+        // #434 — Provenance: these rows come from the device's SQLite store,
+        // uploaded during the Check-Out sync. Honour a client-sent source if
+        // present, else default to 'sqlite'.
+        source: (typeof p?.source === 'string' && p.source) ? p.source : 'sqlite',
       });
     }
 
@@ -2753,5 +2831,34 @@ exports.syncMissingPings = async (req, res) => {
       status:  'Failed',
       message: err.message || 'Server error',
     });
+  }
+};
+
+// GET /api/attendance/location-pings/mine?from=ISO&to=ISO   (JWT)
+// #434 — Returns the set of 2-minute `bucket`s this employee already has in
+// MongoDB (optionally within a recordedAt range). The mobile client calls
+// this at Check-Out to DIFF its local SQLite store against the server and
+// upload ONLY the missing pings, and calls it again afterwards to VERIFY that
+// every local ping now exists in MongoDB before deleting anything locally.
+exports.myLocationPingBuckets = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Not authenticated' });
+
+    const q = { user: userId };
+    const from = req.query?.from ? new Date(String(req.query.from)) : null;
+    const to   = req.query?.to   ? new Date(String(req.query.to))   : null;
+    if ((from && !isNaN(from.getTime())) || (to && !isNaN(to.getTime()))) {
+      q.recordedAt = {};
+      if (from && !isNaN(from.getTime())) q.recordedAt.$gte = from;
+      if (to   && !isNaN(to.getTime()))   q.recordedAt.$lte = to;
+    }
+
+    const rows = await LocationPing.find(q).select('bucket -_id').lean();
+    const buckets = rows.map(r => r.bucket).filter(b => Number.isFinite(b));
+    return res.json({ success: true, count: buckets.length, buckets });
+  } catch (err) {
+    console.error('[myLocationPingBuckets] error:', err.message);
+    return res.status(500).json({ success: false, message: err.message || 'Server error' });
   }
 };

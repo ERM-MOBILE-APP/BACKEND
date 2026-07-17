@@ -48,6 +48,11 @@ const locationPingSchema = new mongoose.Schema(
     // concurrent bursts (3 rows within 69 ms observed for TES080 after
     // a 20-min bg-task gap fired multiple recovery pings at once).
     bucket:     { type: Number, required: true, index: true },
+    // #434 — Provenance marker. Set to 'sqlite' / 'local_storage' when a ping
+    // is uploaded from the mobile device's local SQLite store during the
+    // Check-Out sync (as opposed to a realtime /location-ping). Lets HR / ops
+    // tell offline-collected pings apart from live ones in MongoDB.
+    source:     { type: String, default: '' },
   },
   { timestamps: true }
 );

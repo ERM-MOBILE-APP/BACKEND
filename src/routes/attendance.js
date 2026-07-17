@@ -27,6 +27,7 @@ const {
   lockOfficeAnchor,
   getLockedOfficeAnchor,
   syncMissingPings,
+  myLocationPingBuckets,
 } = require('../controllers/attendanceController');
 
 router.post ('/checkin',       auth, checkIn);
@@ -46,6 +47,10 @@ router.post ('/location-ping', auth, locationPing);     // every 2 min while che
 // stored ping still pending; server dedups by (employeeId + date + localTime)
 // and inserts only the missing ones in chronological order.
 router.post ('/location-pings/missing-pings', auth, syncMissingPings);
+// #434 — Diff/verify helper: returns the buckets this employee already has in
+// MongoDB so the client can upload only the missing ones at Check-Out and
+// verify completeness before deleting local SQLite records.
+router.get  ('/location-pings/mine', auth, myLocationPingBuckets);
 router.post ('/presence',      auth, setPresence);      // active | idle | offline
 router.post ('/auto-checkout', auth, autoCheckOut);     // fires when GPS off mid-day
 router.get  ('/ping-history',  auth, pingHistory);      // HR / audit view
