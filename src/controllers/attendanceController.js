@@ -2368,6 +2368,19 @@ exports.adminDailyRoute = async (req, res) => {
     const route = pings.map(p => ({ lat: p.lat, lng: p.lng, t: p.recordedAt }));
     const fullName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim() || 'Unknown';
 
+    // #441 — Expose the TRUE total pings collected for the day (every row,
+    // including stationary anchors and any outside the shift window) so HR can
+    // see honest coverage. The `route`/polyline stays the clean, non-anchor,
+    // in-window set. The HRMS RouteMapModal reads `pingCount` for the "PINGS"
+    // card and falls back to polyline.length ONLY when pingCount is missing —
+    // which it was, so the card showed the 20 drawn points instead of the 24
+    // rows actually stored. Emitting pingCount/movingPings/anchorPings (the
+    // exact names the modal already looks for) fixes the card with no frontend
+    // redeploy.
+    const totalPings  = await LocationPing.countDocuments({ user: user._id, date });
+    const anchorPings = await LocationPing.countDocuments({ user: user._id, date, isAnchor: true });
+    const movingPings = Math.max(0, totalPings - anchorPings);
+
     return res.json({
       success: true,
       employee: {
@@ -2383,6 +2396,15 @@ exports.adminDailyRoute = async (req, res) => {
       // RouteMapModal both render without a redeploy.
       polyline: route,
       points:   route,
+      // #441 — Ping-count breakdown for the "PINGS" card (names match what
+      // RouteMapModal.jsx already reads: pingCount, movingPings, anchorPings).
+      pingCount:  totalPings,     // ALL pings stored for the day (e.g. 24)
+      totalPings,                 // alias
+      movingPings,                // non-anchor pings (e.g. 20)
+      routePings: route.length,   // non-anchor, in-window points actually drawn
+      anchorPings,                // stationary echoes excluded from the route
+      // #441 — Source label for the modal's "Source" card (was showing "—").
+      distanceSource: route.length >= 2 ? 'gps' : (totalPings > 0 ? 'gps' : 'no-pings'),
       totalKm:         Number((totalM / 1000).toFixed(2)),
       totalDistanceKm: Number((totalM / 1000).toFixed(2)),
     });
