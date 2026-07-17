@@ -2774,29 +2774,32 @@ exports.syncMissingPings = async (req, res) => {
       });
     }
 
-    // ─── Step 3: bulk insert with ordered:false so E11000 on one row
-    //             doesn't abort the whole batch.
+    // ─── Step 3: ROBUST UPSERT via bulkWrite. #435 — Replaces insertMany,
+    // which (depending on the Mongoose/driver version) could throw on the
+    // first dup-key, silently skip rows on validation, and mis-report the
+    // inserted count — the likely cause of "reported inserted but not in DB".
+    // Per-row updateOne+upsert on (user, date, bucket):
+    //   • missing slot → inserted via $setOnInsert
+    //   • existing slot → matched (no-op) — idempotent, no dup-key error
+    //   • ordered:false → one bad row never aborts the rest
+    // bulkWrite uses the raw driver, so it can't be tripped by insertMany's
+    // quirks. The ground-truth re-read below is still authoritative.
     let inserted = 0;
     let existed  = 0;
     try {
-      const result = await LocationPing.insertMany(parsed, {
-        ordered: false,
-        rawResult: true,
-      });
-      // #435 — Don't use `|| parsed.length`: a legitimate 0 (all duplicates)
-      // would wrongly report parsed.length inserted. Trust the real number.
-      inserted = (typeof result?.insertedCount === 'number') ? result.insertedCount : parsed.length;
+      const ops = parsed.map(p => ({
+        updateOne: {
+          filter: { user: p.user, date: p.date, bucket: p.bucket },
+          update: { $setOnInsert: p },
+          upsert: true,
+        },
+      }));
+      const result = await LocationPing.bulkWrite(ops, { ordered: false });
+      inserted = result?.upsertedCount || 0;
+      existed  = result?.matchedCount  || 0;
     } catch (err) {
-      const writeErrors = err?.writeErrors || err?.result?.result?.writeErrors || [];
-      const okCount     = err?.result?.result?.nInserted
-                       ?? err?.insertedDocs?.length
-                       ?? (parsed.length - writeErrors.length);
-      inserted = Number(okCount) || 0;
-      for (const we of writeErrors) {
-        const isDup = we?.code === 11000 || /E11000|duplicate key/i.test(String(we?.errmsg || we?.message || ''));
-        if (isDup) existed += 1;
-        else console.warn('[missing-pings] non-dup write error:', we?.errmsg || we?.message);
-      }
+      // Partial failures still get reported truthfully by the re-read below.
+      console.warn('[missing-pings] bulkWrite error (continuing to verify):', err?.message || err);
     }
 
     // #435 — GROUND-TRUTH VERIFICATION. Rather than trust insertMany's
