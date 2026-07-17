@@ -2778,16 +2778,14 @@ exports.syncMissingPings = async (req, res) => {
     //             doesn't abort the whole batch.
     let inserted = 0;
     let existed  = 0;
-    const insertedBuckets = [];
-    const existedBuckets  = [];
-
     try {
       const result = await LocationPing.insertMany(parsed, {
         ordered: false,
         rawResult: true,
       });
-      inserted = result.insertedCount || parsed.length;
-      parsed.forEach(p => insertedBuckets.push(p.bucket));
+      // #435 — Don't use `|| parsed.length`: a legitimate 0 (all duplicates)
+      // would wrongly report parsed.length inserted. Trust the real number.
+      inserted = (typeof result?.insertedCount === 'number') ? result.insertedCount : parsed.length;
     } catch (err) {
       const writeErrors = err?.writeErrors || err?.result?.result?.writeErrors || [];
       const okCount     = err?.result?.result?.nInserted
@@ -2796,22 +2794,36 @@ exports.syncMissingPings = async (req, res) => {
       inserted = Number(okCount) || 0;
       for (const we of writeErrors) {
         const isDup = we?.code === 11000 || /E11000|duplicate key/i.test(String(we?.errmsg || we?.message || ''));
-        const idx = typeof we?.index === 'number' ? we.index : null;
-        const row = (idx != null && parsed[idx]) ? parsed[idx] : null;
-        if (isDup) {
-          existed += 1;
-          if (row) existedBuckets.push(row.bucket);
-        } else {
-          console.warn('[missing-pings] non-dup write error:', we?.errmsg || we?.message);
-        }
+        if (isDup) existed += 1;
+        else console.warn('[missing-pings] non-dup write error:', we?.errmsg || we?.message);
       }
-      const errIdx = new Set(writeErrors.map(w => w?.index).filter(i => typeof i === 'number'));
-      parsed.forEach((p, i) => { if (!errIdx.has(i)) insertedBuckets.push(p.bucket); });
     }
+
+    // #435 — GROUND-TRUTH VERIFICATION. Rather than trust insertMany's
+    // (optimistic) accounting, RE-READ MongoDB and report which of the
+    // shipped buckets ACTUALLY exist now. This is authoritative: if a write
+    // silently failed, was rejected, or the process is pointed at a different
+    // database, it shows up here as "missing". The client marks a local row
+    // synced ONLY if its bucket is in `confirmedBuckets`, so a row can never
+    // be deleted locally unless it is genuinely present in MongoDB.
+    const allBuckets = [...new Set(parsed.map(p => p.bucket))];
+    let confirmedBuckets = [];
+    try {
+      const present = await LocationPing.find({ user: userId, bucket: { $in: allBuckets } })
+        .select('bucket -_id').lean();
+      confirmedBuckets = [...new Set(present.map(d => d.bucket))];
+    } catch (e) {
+      console.warn('[missing-pings] ground-truth re-read failed:', e.message);
+      confirmedBuckets = []; // conservative: nothing confirmed → client retains + retries
+    }
+    const confirmedSet   = new Set(confirmedBuckets);
+    const missingBuckets = allBuckets.filter(b => !confirmedSet.has(b));
 
     console.log(
       `[missing-pings] ${empId} DONE received=${raw.length} parsed=${parsed.length} ` +
-      `inserted=${inserted} existed=${existed} status=Success`
+      `inserted=${inserted} existed=${existed} ` +
+      `storedInDb=${confirmedBuckets.length}/${allBuckets.length} missing=${missingBuckets.length} ` +
+      `db=${require('mongoose').connection?.name || '?'} status=${missingBuckets.length === 0 ? 'Complete' : 'Partial'}`
     );
 
     return res.json({
@@ -2820,8 +2832,17 @@ exports.syncMissingPings = async (req, res) => {
       alreadyExisted:     existed,
       inserted,
       duplicatesSkipped:  existed,
-      insertedBuckets,
-      existedBuckets,
+      // #435 — Ground-truth from a fresh DB read.
+      storedInDb:         confirmedBuckets.length,
+      confirmedBuckets,                       // truly present in MongoDB now
+      missingBuckets,                         // NOT stored — client keeps pending
+      dbName:             require('mongoose').connection?.name || '',
+      // Back-compat: older clients union insertedBuckets ∪ existedBuckets and
+      // mark those synced — feed them the ground-truth confirmed set so they
+      // also never mark an absent row as synced.
+      insertedBuckets:    confirmedBuckets,
+      existedBuckets:     [],
+      complete:           missingBuckets.length === 0,
       status:             'Success',
     });
   } catch (err) {
