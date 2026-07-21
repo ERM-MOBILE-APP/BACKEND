@@ -61,6 +61,42 @@ async function resolveLabel(value, kind) {
 
 const todayISO = () => new Date().toISOString().split('T')[0];
 
+// #453 — CROSS-SYSTEM STATUS NORMALISER.
+//
+// ERM and HRMS share the same Mongo cluster but use DIFFERENT status
+// vocabularies:
+//   ERM  : 'present' | 'late' | 'absent' | 'permission' | 'halfday' | 'leave'
+//   HRMS : 'On Time' | 'Late' | 'Absent' | 'Half Day'   (capitalised)
+//
+// HRMS's /mark-status route proxies to this backend but ALSO writes the
+// override into its own Attendance collection as a fallback. So after HR
+// flips a day in HRMS, the row can come back carrying an HRMS-flavoured
+// value like 'On Time' or 'Half Day'. The ERM clients look that string up in
+// a lowercase map, miss, and render a grey "—" badge — which is what the
+// employee saw for exactly the days HR had edited.
+//
+// Normalising here means every ERM consumer (mobile + web) always receives
+// the canonical lowercase vocabulary, whichever system last wrote the row.
+const STATUS_ALIASES = {
+  'on time':    'present',
+  'ontime':     'present',
+  'on-time':    'present',
+  'present':    'present',
+  'late':       'late',
+  'absent':     'absent',
+  'leave':      'leave',
+  'on leave':   'leave',
+  'permission': 'permission',
+  'half day':   'halfday',
+  'half-day':   'halfday',
+  'halfday':    'halfday',
+};
+function normalizeStatus(s) {
+  const key = String(s == null ? '' : s).trim().toLowerCase();
+  if (!key) return '';
+  return STATUS_ALIASES[key] || key;
+}
+
 /**
  * Haversine distance in km between two lat/lng pairs. Returns 0 for
  * invalid inputs so callers can sum safely.
@@ -741,7 +777,21 @@ exports.checkOut = async (req, res) => {
           if (e && e.code === 11000) {
             // duplicate bucket — client ping already recorded this slot
           } else {
-            throw e;
+            // #456 — DO NOT abort Check Out because a cosmetic ping row failed.
+            //
+            // This used to `throw e`, which propagated to the handler's outer
+            // catch and returned { message: 'Server error' } — the employee saw
+            // a "Server error" dialog and could not check out, even though the
+            // attendance record itself was perfectly valid. The checkout ping is
+            // a nice-to-have breadcrumb; the CHECK-OUT is the business-critical
+            // operation and must never be blocked by it.
+            //
+            // Now matches the check-in path (line ~439), which has always just
+            // logged and continued. Failure modes this protects against:
+            // validation errors, a transient Mongo write error, or index
+            // contention — all far more likely now that live upload writes many
+            // more pings around checkout time.
+            console.warn('[checkOut] checkout ping save failed (non-fatal):', e.message);
           }
         }
       }
@@ -870,7 +920,11 @@ exports.getMonthly = async (req, res) => {
     // shows in the mobile calendar immediately (single source of truth).
     const result = records.map(r => ({
       date: r.date,
-      status: (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status,
+      // #453 — normalise so an HRMS-flavoured value ('On Time', 'Half Day')
+      // can never reach the client as an unmapped status (grey "—" badge).
+      status: normalizeStatus(
+        (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status
+      ),
     }));
     res.json(result);
   } catch (err) {
@@ -921,9 +975,11 @@ exports.getCalendar = async (req, res) => {
         // #417 — HR override + workedHours safety net (same rules as
         // getHistory). Ensures the mobile calendar shows the HR-flipped
         // status and correct hours for auto-closed rows.
-        const effectiveStatus = (r.hrOverride === true && r.hrOverrideStatus)
-          ? r.hrOverrideStatus
-          : r.status;
+        // #453 — normalise cross-system vocabulary ('On Time' → 'present',
+        // 'Half Day' → 'halfday') so HR-edited rows never render as grey "—".
+        const effectiveStatus = normalizeStatus(
+          (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status
+        );
         let workedHours = Number(r.workedHours || 0);
         const accSeconds = Number(r.accumulatedSeconds || 0);
         if (workedHours <= 0 && accSeconds > 0) {
@@ -985,20 +1041,23 @@ const HOLIDAYS = new Set(
 );
 const isHolidayISO = (iso) => HOLIDAYS.has(iso);
 
-// Counts: present, absent, late, permission, halfday, leave
-exports.getSummary = async (req, res) => {
-  try {
-    const month = parseInt(req.query.month, 10);
-    const year = parseInt(req.query.year, 10);
-    if (!month || !year) {
-      return res.status(400).json({ message: 'month and year required' });
-    }
-    const { start, end } = monthBounds(month, year);
+// #455 — Extracted from getSummary so the SAME math can serve both:
+//   • GET /api/attendance/summary        (employee, self-scoped)
+//   • GET /api/attendance/admin/summary  (HR, any employee — used by HRMS)
+//
+// HRMS's "Monthly Overview" panel previously recomputed its own counts in the
+// browser with DIFFERENT rules (it folded Late into Present, counted Absent as
+// only the rows literally marked absent, and read Permission off the day
+// status). That guaranteed HRMS and the ERM attendance cards would disagree.
+// Both now read this single function, so the two screens agree by construction
+// instead of by coincidence.
+async function computeMonthlySummary(userId, month, year) {
+  const { start, end } = monthBounds(month, year);
 
-    const records = await Attendance.find({
-      user: req.user.id,
-      date: { $gte: start, $lte: end },
-    }).lean();
+  const records = await Attendance.find({
+    user: userId,
+    date: { $gte: start, $lte: end },
+  }).lean();
 
     // #425 — Apply the same fully-approved leave/permission overlay used
     // by getMonthly / getCalendar BEFORE counting. Without this, the
@@ -1014,7 +1073,7 @@ exports.getSummary = async (req, res) => {
     // days that a fully-approved request covers, so the count loop
     // afterwards trivially inherits the correct semantics.
     const leaves = await Leave.find({
-      user: req.user.id,
+      user: userId,
       status: 'approved',              // HR final approval
       managerStatus: 'Approved',       // Manager approval
       $or: [
@@ -1022,7 +1081,7 @@ exports.getSummary = async (req, res) => {
         { requestType: 'permission', date: { $gte: start, $lte: end } },
       ],
     }).lean();
-    const uidStr = String(req.user.id);
+    const uidStr = String(userId);
     records.forEach(r => { if (!r.user) r.user = uidStr; });
     const shimmedLeaves = leaves.map(l => ({ ...l, user: uidStr }));
     applyLeavePermissionOverlay(records, shimmedLeaves, { rangeStart: start, rangeEnd: end });
@@ -1039,9 +1098,12 @@ exports.getSummary = async (req, res) => {
     };
     records.forEach((r) => {
       // #417 — HR override wins over derived status.
-      const effective = (r.hrOverride === true && r.hrOverrideStatus)
-        ? r.hrOverrideStatus
-        : r.status;
+      // #453 — normalised so an HRMS-written 'On Time' / 'Half Day' still
+      // lands in the right counter instead of being silently ignored (which
+      // previously under-counted Present/Half-day for HR-edited days).
+      const effective = normalizeStatus(
+        (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status
+      );
       if (summary[effective] !== undefined) summary[effective] += 1;
     });
 
@@ -1104,7 +1166,7 @@ exports.getSummary = async (req, res) => {
     // (which are also counted as present) are not double-subtracted.
     try {
       summary.permission = await Leave.countDocuments({
-        user: req.user.id,
+        user: userId,
         requestType: 'permission',
         status: 'approved',            // HR approval — matches the UI badge
         date: { $gte: start, $lte: end },
@@ -1114,7 +1176,62 @@ exports.getSummary = async (req, res) => {
       // the whole summary response.
     }
 
+  return summary;
+}
+
+// GET /api/attendance/summary?month=&year=   (employee — self-scoped)
+exports.getSummary = async (req, res) => {
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+    if (!month || !year) {
+      return res.status(400).json({ message: 'month and year required' });
+    }
+    const summary = await computeMonthlySummary(req.user.id, month, year);
     res.json(summary);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+// #455 — GET /api/attendance/admin/summary?employeeId=|userId=&month=&year=
+//
+// HR-only (x-admin-secret). Returns the EXACT same summary object as the
+// employee-facing /summary endpoint, for any employee. HRMS's "Monthly
+// Overview" panel calls this instead of recomputing counts in the browser,
+// so the HRMS panel and the ERM attendance cards can never disagree again.
+exports.adminSummary = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+    if (!month || !year) {
+      return res.status(400).json({ message: 'month and year required' });
+    }
+
+    // Resolve the target user from either an explicit userId or the human
+    // employeeId ("TES080"), mirroring adminMarkStatus's resolution rules.
+    const { userId, employeeId } = req.query;
+    let userRef = null;
+    if (userId && mongoose.Types.ObjectId.isValid(String(userId))) {
+      userRef = userId;
+    } else if (employeeId) {
+      const u = await User
+        .findOne({ employeeId: String(employeeId).trim().toUpperCase() })
+        .select('_id')
+        .lean();
+      if (!u) return res.status(404).json({ message: `Employee ${employeeId} not found` });
+      userRef = u._id;
+    } else {
+      return res.status(400).json({ message: 'userId or employeeId is required' });
+    }
+
+    const summary = await computeMonthlySummary(userRef, month, year);
+    res.json({ success: true, ...summary });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -1151,9 +1268,11 @@ exports.getHistory = async (req, res) => {
         // we return `hrOverrideStatus` explicitly as a belt-and-braces
         // safeguard so downstream re-derivation (dashboards, reports)
         // can't accidentally undo HR's decision.
-        const effectiveStatus = (r.hrOverride === true && r.hrOverrideStatus)
-          ? r.hrOverrideStatus
-          : r.status;
+        // #453 — normalise cross-system vocabulary ('On Time' → 'present',
+        // 'Half Day' → 'halfday') so HR-edited rows never render as grey "—".
+        const effectiveStatus = normalizeStatus(
+          (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status
+        );
         // #417 — Display-side workedHours safety net. Legacy rows and
         // rows closed by pre-#417 autoCloseAttendance could have
         // workedHours=0 even though checkIn+checkOut both exist. If

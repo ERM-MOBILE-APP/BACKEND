@@ -8,6 +8,7 @@ const {
   getMonthly,
   getCalendar,
   getSummary,
+  adminSummary,
   getHistory,
   createRequest,
   listRequests,
@@ -65,6 +66,11 @@ router.get  ('/admin/requests',         adminListRequests);
 router.patch('/admin/requests/:id',     adminUpdateRequest);
 // #352d — HR-only manual status override. Body: { userId|employeeId, date, status, note? }
 router.patch('/admin/mark-status',       adminMarkStatus);
+// #455 — HR-only monthly summary for ANY employee. Returns the identical
+// object the employee's own /summary returns, so HRMS's Monthly Overview
+// panel matches the ERM attendance cards exactly instead of recomputing.
+// Query: ?employeeId=TES080&month=7&year=2026  (or ?userId=<objectId>)
+router.get  ('/admin/summary',           adminSummary);
 router.get  ('/admin/live-locations',  adminLiveLocations);
 // #370 — Per-employee ping analytics for a date. Returns count, first/last
 // ping, elapsed vs pinged minutes, coverage %, largest gap. Header:
