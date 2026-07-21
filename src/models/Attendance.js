@@ -159,14 +159,20 @@ function normaliseStatusValue(v) {
   return STATUS_ALIASES[key] || v;
 }
 
-attendanceSchema.pre('validate', function (next) {
+// NOTE ON THE SIGNATURE: this hook takes NO arguments on purpose.
+// It was first written as `function (next) { … next(); }`, which made every
+// checkout fail with "next is not a function" — in this Mongoose version the
+// hook wasn't being invoked with a callback, so calling next() threw and the
+// save was rejected. A zero-argument hook is treated as promise/sync style:
+// Mongoose continues as soon as it returns, so there is no callback to get
+// wrong. Keep it argument-free.
+attendanceSchema.pre('validate', function () {
   try {
     if (this.status) this.status = normaliseStatusValue(this.status);
     // hrOverrideStatus is a free-form String (no enum) but is read back as an
     // authoritative status by every ERM read path, so heal it too.
     if (this.hrOverrideStatus) this.hrOverrideStatus = normaliseStatusValue(this.hrOverrideStatus);
   } catch { /* never block a save on the normaliser itself */ }
-  next();
 });
 
 attendanceSchema.plugin(stampEmployeeId);
