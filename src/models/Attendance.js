@@ -121,6 +121,54 @@ const attendanceSchema = new mongoose.Schema(
 
 attendanceSchema.index({ user: 1, date: 1 }, { unique: true });
 
+// #457 — SELF-HEALING STATUS NORMALISER (cross-system compatibility).
+//
+// PRODUCTION BUG THIS FIXES: employees could not CHECK OUT. The server
+// returned 500 with:
+//   "Attendance validation failed: status: `On Time` is not a valid enum
+//    value for path `status`."
+//
+// Cause: HRMS and ERM share this collection but use different vocabularies —
+//   ERM  : 'present' | 'late' | 'absent' | 'permission' | 'halfday' | 'leave'
+//   HRMS : 'On Time' | 'Late' | 'Absent' | 'Half Day'   (capitalised)
+// HRMS's mark-status writes its own wording into the row. Afterwards ANY ERM
+// save on that document — check-out, check-in, the auto-close cron — runs
+// Mongoose validation over the WHOLE document, hits the foreign 'On Time'
+// value sitting in `status`, and throws. So one HR edit permanently blocked
+// that employee from checking out.
+//
+// Normalising in a pre('validate') hook heals the value on every save path at
+// once (rather than patching each controller), and repairs legacy rows the
+// first time they're touched.
+const STATUS_ALIASES = {
+  'on time':    'present',
+  'ontime':     'present',
+  'on-time':    'present',
+  'present':    'present',
+  'late':       'late',
+  'absent':     'absent',
+  'leave':      'leave',
+  'on leave':   'leave',
+  'permission': 'permission',
+  'half day':   'halfday',
+  'half-day':   'halfday',
+  'halfday':    'halfday',
+};
+function normaliseStatusValue(v) {
+  const key = String(v == null ? '' : v).trim().toLowerCase();
+  return STATUS_ALIASES[key] || v;
+}
+
+attendanceSchema.pre('validate', function (next) {
+  try {
+    if (this.status) this.status = normaliseStatusValue(this.status);
+    // hrOverrideStatus is a free-form String (no enum) but is read back as an
+    // authoritative status by every ERM read path, so heal it too.
+    if (this.hrOverrideStatus) this.hrOverrideStatus = normaliseStatusValue(this.hrOverrideStatus);
+  } catch { /* never block a save on the normaliser itself */ }
+  next();
+});
+
 attendanceSchema.plugin(stampEmployeeId);
 
 module.exports = mongoose.model('Attendance', attendanceSchema);
