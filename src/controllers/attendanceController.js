@@ -1078,6 +1078,42 @@ exports.getSummary = async (req, res) => {
       )
     );
 
+    // #451 — PERMISSIONS COUNT FIX.
+    //
+    // BUG: an employee could apply for a permission, see it as "Approved" in
+    // Permission History, and still see PERMISSIONS = 00 on the summary card.
+    // Two compounding causes:
+    //   1. The count was derived from ATTENDANCE rows whose status ended up
+    //      as 'permission'. But applyLeavePermissionOverlay deliberately
+    //      rewrites a PAST permission day to 'present' whenever the employee
+    //      has a check-in ("the permission excused the lateness"). So a normal
+    //      partial-day permission (e.g. 01:00-02:00 PM on a day the employee
+    //      attended) could NEVER be counted — the row was always 'present'.
+    //   2. The overlay only considers requests approved by BOTH tiers
+    //      (managerStatus 'Approved' AND status 'approved'), while the app's
+    //      History badge shows "Approved" on HR approval alone
+    //      (frontend leave.tsx: item.status === 'approved'). So an HR-approved
+    //      permission displayed as Approved but was invisible to the counter.
+    //
+    // FIX: count the PERMISSION REQUESTS themselves for the month, using the
+    // SAME condition the UI uses to render the "Approved" badge. The card now
+    // always agrees with what the employee sees in Permission History.
+    //
+    // NOTE: this deliberately runs AFTER summary.absent is computed, so the
+    // absent math still uses the attendance-derived value and permission days
+    // (which are also counted as present) are not double-subtracted.
+    try {
+      summary.permission = await Leave.countDocuments({
+        user: req.user.id,
+        requestType: 'permission',
+        status: 'approved',            // HR approval — matches the UI badge
+        date: { $gte: start, $lte: end },
+      });
+    } catch (e) {
+      // Leave the attendance-derived value as a fallback rather than failing
+      // the whole summary response.
+    }
+
     res.json(summary);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
