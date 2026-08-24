@@ -1181,6 +1181,11 @@ async function computeMonthlySummary(userId, month, year) {
   return summary;
 }
 
+// Exported so the Manager team report (managerController.attendanceSummary)
+// can reuse the EXACT same counts HRMS + ERM show — same leave/permission
+// overlay, same holiday-as-present rule, same approved-permission count.
+exports.computeMonthlySummary = computeMonthlySummary;
+
 // GET /api/attendance/summary?month=&year=   (employee — self-scoped)
 exports.getSummary = async (req, res) => {
   try {
@@ -1337,6 +1342,14 @@ exports.createRequest = async (req, res) => {
       expectedCheckIn: expectedCheckIn || '',
       expectedCheckOut: expectedCheckOut || '',
     });
+    try {
+      const { notifyManagerOfRequest } = require('../utils/notifyManager');
+      notifyManagerOfRequest(req.user.id, {
+        type: 'attendance',
+        summary: `Attendance ${requestType || 'regularize'} for ${date}`,
+        link: '/manager/approvals?tab=attnreq',
+      }).catch(() => {});
+    } catch (_) { /* best-effort */ }
     res.status(201).json(reqDoc);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });

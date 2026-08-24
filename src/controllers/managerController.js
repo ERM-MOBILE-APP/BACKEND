@@ -106,7 +106,7 @@ async function resolveTeamIds(req) {
   const uniqNames = [...new Set(names.filter((s) => s && String(s).trim()))];
   const team = await User
     .find(assignedToFilter(uniqNames))
-    .select('_id firstName lastName name email employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt')
+    .select('_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt')
     .lean();
   return { manager: me, team, names: uniqNames };
 }
@@ -208,6 +208,7 @@ exports.team = async (req, res) => {
         employeeId: u.employeeId,
         name:       u.name || [u.firstName, u.lastName].filter(Boolean).join(' ').trim(),
         email:      u.email,
+        phone:      u.phone || '',
         photoUrl:   u.photoUrl || '',
         designation: pickLabel(u.designation, u.designationTitle),
         department:  pickLabel(u.department,  u.departmentName),
@@ -472,42 +473,51 @@ exports.attendanceSummary = async (req, res) => {
     const lastDay = new Date(year, month, 0).getDate();
     const end   = `${year}-${monthStr}-${String(lastDay).padStart(2, '0')}`;
 
-    const rows = await Attendance.find({
+    // #470 — Use the CANONICAL monthly summary the ERM app + HRMS use
+    // (computeMonthlySummary), so the manager's team report shows the EXACT
+    // same present / late / absent / permission counts HR sees. That routine
+    // applies the fully-approved leave/permission overlay, the holiday-as-
+    // present rule, and the approved-permission count fix (#451). Reading the
+    // raw Attendance.status here (the old approach) diverged from HRMS on
+    // permission days, HR-overridden days, Sundays, and reclassified late
+    // arrivals. Lazy-require avoids any module-load cycle with the controller.
+    const { computeMonthlySummary } = require('./attendanceController');
+
+    // One bulk query for worked-hours totals (computeMonthlySummary doesn't
+    // return hours). Summed per member from the same month's rows.
+    const hourRows = await Attendance.find({
       user: { $in: team.map((u) => u._id) },
       date: { $gte: start, $lte: end },
-    }).lean();
+    }).select('user workedHours').lean();
+    const hoursByUser = new Map();
+    for (const r of hourRows) {
+      const k = String(r.user);
+      hoursByUser.set(k, (hoursByUser.get(k) || 0) + Number(r.workedHours || 0));
+    }
 
-    const summaryByUser = new Map();
-    for (const u of team) {
-      summaryByUser.set(String(u._id), {
-        userId:     String(u._id),
-        employeeId: u.employeeId,
-        name:       u.name || [u.firstName, u.lastName].filter(Boolean).join(' ').trim(),
+    const items = await Promise.all(team.map(async (u) => {
+      let s = { present: 0, late: 0, absent: 0, permission: 0, halfday: 0, leave: 0 };
+      try {
+        s = await computeMonthlySummary(u._id, month, year);
+      } catch (e) {
+        console.warn('[manager.attendanceSummary] computeMonthlySummary failed for', String(u._id), e.message);
+      }
+      return {
+        userId:      String(u._id),
+        employeeId:  u.employeeId,
+        name:        u.name || [u.firstName, u.lastName].filter(Boolean).join(' ').trim(),
         designation: pickLabel(u.designation, u.designationTitle),
-        present: 0, late: 0, absent: 0, permission: 0, halfday: 0,
-        totalWorkedHours: 0,
-      });
-    }
-    for (const r of rows) {
-      const s = summaryByUser.get(String(r.user));
-      if (!s) continue;
-      const st = String(r.status || '').toLowerCase();
-      if      (st === 'present')      s.present    += 1;
-      else if (st === 'late')         s.late       += 1;
-      else if (st === 'absent')       s.absent     += 1;
-      else if (st === 'permission')   s.permission += 1;
-      else if (st === 'halfday' || st === 'half-day') s.halfday += 1;
-      // Approved permission can coexist with a Present day (the day
-      // collapses to present after the window closes). Count it too so
-      // the manager summary matches HRMS.
-      if (r.hasPermission === true && st !== 'permission') s.permission += 1;
-      s.totalWorkedHours += Number(r.workedHours || 0);
-    }
-    res.json({
-      success: true,
-      month, year,
-      items: [...summaryByUser.values()],
-    });
+        present:     s.present    || 0,
+        late:        s.late       || 0,
+        absent:      s.absent     || 0,
+        permission:  s.permission || 0,
+        halfday:     s.halfday    || 0,
+        leave:       s.leave      || 0,
+        totalWorkedHours: hoursByUser.get(String(u._id)) || 0,
+      };
+    }));
+
+    res.json({ success: true, month, year, items });
   } catch (err) {
     console.error('[manager.attendanceSummary]', err);
     res.status(500).json({ success: false, message: err.message });
@@ -529,7 +539,7 @@ exports.liveLocations = async (req, res) => {
     const atts = await Attendance.find({
       user: { $in: team.map((u) => u._id) },
       date: today,
-    }).select('user checkIn checkOut workedHours').lean();
+    }).select('user checkIn checkOut workedHours checkInLat checkInLng').lean();
     for (const a of atts) attendanceMap.set(String(a.user), a);
 
     const out = await Promise.all(team.map(async (u) => {
@@ -567,6 +577,11 @@ exports.liveLocations = async (req, res) => {
         status,
         checkIn:    att?.checkIn  || null,
         checkOut:   att?.checkOut || null,
+        // Where the employee CHECKED IN today (for the "checked in at"
+        // place label on the manager Live Tracking screen). Distinct from
+        // lat/lng, which is their latest/current position.
+        checkInLat: att?.checkInLat ?? null,
+        checkInLng: att?.checkInLng ?? null,
         lastSeen:   recordedAt,
       };
     }));

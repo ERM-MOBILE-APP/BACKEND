@@ -69,18 +69,15 @@ exports.list = async (req, res) => {
     // array) and inject it on the response. Strip the (potentially
     // large) readBy array before sending so the wire payload stays slim.
     const meId = req.user && req.user.id ? String(req.user.id) : '';
-    // ── Team-scoped announcements (manager posts) ─────────────────────
-    // A manager can post an announcement to ONLY their direct team
-    // (audience:'team' + audienceUserIds snapshot). Those must never leak
-    // to the whole company, so filter them out here unless the current
-    // user is in the audience (or is the poster). 'all'/'department'/
-    // unset announcements are unaffected — everyone still sees them.
-    const visible = items.filter((r) => {
-      if (String(r.audience || 'all') !== 'team') return true;
-      const aud = Array.isArray(r.audienceUserIds) ? r.audienceUserIds.map(String) : [];
-      if (!meId) return false;
-      return aud.includes(meId) || String(r.postedByUser || '') === meId;
-    });
+    // ── Home feed = HR / company announcements ONLY ───────────────────
+    // Manager-posted team announcements (audience:'team') must NOT appear
+    // in the employee Home announcements feed — they belong only in the
+    // Manager > Announcements screen (GET /api/manager/announcements), and
+    // team members are informed via a push notification when one is posted.
+    // So the Home feed here shows only 'all' / 'department' (HR/company)
+    // announcements. This also fixes the "Posted by HR" mislabel that
+    // appeared when a manager post surfaced on Home.
+    const visible = items.filter((r) => String(r.audience || 'all') !== 'team');
     const shaped = visible.map((r) => {
       const readBy = Array.isArray(r.readBy) ? r.readBy.map(String) : [];
       const isRead = meId ? readBy.includes(meId) : false;

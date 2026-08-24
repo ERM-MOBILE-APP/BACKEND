@@ -164,6 +164,14 @@ exports.applyLeave = async (req, res) => {
       daysCount: daysBetween(startDate, endDate, !!isHalfDay),
       reason,
     });
+    // Live-notify the employee's manager so it lands on their bell.
+    try {
+      const { notifyManagerOfRequest } = require('../utils/notifyManager');
+      notifyManagerOfRequest(req.user.id, {
+        type: 'leave',
+        summary: `${leaveType} ${startDate}${endDate && endDate !== startDate ? ` → ${endDate}` : ''}`,
+      }).catch(() => {});
+    } catch (_) { /* best-effort */ }
     res.status(201).json({ message: 'Leave applied successfully', leave });
   } catch (err) {
     console.error(err);
@@ -219,6 +227,13 @@ exports.applyPermission = async (req, res) => {
       durationHours: hours,
       reason,
     });
+    try {
+      const { notifyManagerOfRequest } = require('../utils/notifyManager');
+      notifyManagerOfRequest(req.user.id, {
+        type: 'leave',
+        summary: `Permission ${date} (${startTime}–${endTime})`,
+      }).catch(() => {});
+    } catch (_) { /* best-effort */ }
     res.status(201).json({ message: 'Permission applied successfully', permission });
   } catch (err) {
     console.error(err);
