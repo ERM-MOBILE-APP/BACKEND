@@ -127,6 +127,16 @@ function applyLeavePermissionOverlay(items, leaves, { rangeStart, rangeEnd, now 
         const nowInWindow = permEnd ? nowMs < permEnd.getTime() : false;
 
         if (existing) {
+          // #468 — Mark that this employee/date carried an approved
+          // permission, INDEPENDENT of the display status. After the
+          // window closes a permission day collapses into 'present'
+          // (branch b) or 'absent' (branch c), so `status === 'permission'`
+          // can no longer be counted. Consumers (HRMS dashboard calendar,
+          // Reports permission column, LOP policy) count this flag instead,
+          // matching the Leave & Permission page which counts approved
+          // permission REQUESTS. The flag is set even when hrOverride wins,
+          // because the permission was genuinely approved on that date.
+          existing.hasPermission = true;
           if (existing.hrOverride === true) continue;
           if (nowInWindow) {
             existing.status = 'permission';
@@ -158,6 +168,7 @@ function applyLeavePermissionOverlay(items, leaves, { rangeStart, rangeEnd, now 
             durationHours: lv.durationHours || null,
             isOverlay: true,
             _leaveOverlay: true,
+            hasPermission: true,   // #468 — count this as an approved permission
             leaveType: lv.permissionType || '',
             reason:    lv.reason || '',
           });

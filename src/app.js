@@ -87,6 +87,10 @@ app.use('/api/payslip', require('./routes/payslip'));
 app.use('/api/announcement', require('./routes/announcement'));
 app.use('/api/notification', require('./routes/notification'));
 app.use('/api/complaint',    require('./routes/complaint'));
+// Manager surface — team-scoped reads + approvals (JWT). Mirrors the ERM
+// Web /api/manager routes; both backends share the same MongoDB so manager
+// actions are instantly reflected across mobile / web / HRMS.
+app.use('/api/manager',      require('./routes/manager'));
 // Admin one-off maintenance (backfill emp id, etc.) — gated by x-admin-secret.
 app.use('/api/admin',        require('./routes/adminBackfill'));
 

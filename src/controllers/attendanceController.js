@@ -191,7 +191,7 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
 
   const pings = await LocationPing.find(q)
     .sort({ recordedAt: 1 })
-    .select('lat lng recordedAt')
+    .select('lat lng recordedAt accuracy')   // #466 — accuracy needed for road-match cleaning
     .lean();
 
   // #380 — Count ALL rows for this employee+date (moving + anchor)
@@ -214,22 +214,24 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
   const movingPings = pings.length;
 
   if (pings.length >= 2) {
-    // Sum the FULL ping list for accurate km — every micro-movement
-    // counts toward distance even if we won't render it. Then SIMPLIFY
-    // before serializing the polyline to keep the response payload small.
-    let total = 0;
-    for (let i = 1; i < pings.length; i++) {
-      total += haversineKm(pings[i - 1], pings[i]);
-    }
+    // #466 — ROAD-ACCURATE DISTANCE (canonical). Was a straight-line haversine
+    // sum, which over-counted GPS drift and cut across fields. Now the same
+    // OSRM road-matcher used by adminDailyRoute computes BOTH the km and the
+    // road-following polyline, so the Daily-Routes list, ERM mobile, and PETROL
+    // BILLING (which reads this km) all agree with the HRMS route modal and
+    // reflect real road travel. Falls back to guarded haversine on OSRM
+    // failure so it never inflates.
+    const measured = await roadSnapAndMeasure(pings);
+    const total = measured.distanceKm;
     const first = pings[0];
     const last  = pings[pings.length - 1];
     const compact = simplifyPolyline(
-      pings.map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
+      (measured.path && measured.path.length >= 2 ? measured.path : pings).map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
       10,   // metres — dropping noise-level deltas
     );
     return {
       distanceKm: Math.round(total * 100) / 100,
-      source:     'gps',
+      source:     measured.source === 'osrm' ? 'osrm-road' : 'gps',
       polyline:   compact,
       from:       { lat: first.lat, lng: first.lng, at: first.recordedAt },
       to:         { lat: last.lat,  lng: last.lng,  at: last.recordedAt  },
@@ -2174,14 +2176,21 @@ exports.adminLiveLocations = async (req, res) => {
       let status = 'offline';
       let site   = 'Last known location';
       if (lat != null && lng != null) {
-        // PRESENCE-FIRST RULE (Jun 2026 HR policy):
-        // The mobile app calls setPresence('offline') the moment device
-        // location is detected as off. We honour that immediately — no
-        // grace window — so HRMS flips the row to "Offline" on the very
-        // next 45 sec poll. If we waited for the ping to age past the
-        // 25-min stale window, HR would still see the employee as
-        // active for up to 25 min after they'd turned location off.
-        if (u.presence === 'offline') {
+        // #467 — PING-FRESHNESS FIRST. A location ping newer than the stale
+        // window means the employee IS active. ANY ping that reached the server
+        // — realtime OR batch-synced from local SQLite — now marks the employee
+        // live on the map, EVEN IF the `presence` flag is a stale 'offline'
+        // left over from a GPS-off blip or a previous session. This guarantees
+        // the requirement: every stored ping is treated as active and reflected
+        // on Live Tracking.
+        const freshAgeMin  = recordedAt ? (Date.now() - new Date(recordedAt).getTime()) / 60000 : 999;
+        const hasFreshPing = freshAgeMin <= 15;
+
+        // PRESENCE-FIRST RULE (Jun 2026 HR policy) — now applies ONLY when there
+        // is NO fresh ping. The app calls setPresence('offline') the moment
+        // device location is detected off; honour that immediately, BUT a fresh
+        // ping overrides it (real, recent movement beats a stale flag).
+        if (u.presence === 'offline' && !hasFreshPing) {
           status = 'offline';
           site   = 'Location off';
           // Resolve labels + return early before any geofence/freshness logic
@@ -2437,6 +2446,118 @@ exports.adminDailyRoutesList = async (req, res) => {
   }
 };
 
+// #465 — ROAD SNAPPING (OSRM map-matching).
+//
+// The HRMS route map draws a straight polyline through the raw GPS points, so
+// points captured 2 min apart while driving get connected by a line that cuts
+// across fields, lakes and buildings. OSRM's /match service snaps a GPS trace
+// onto the actual road network and returns the road geometry BETWEEN points,
+// so the drawn line follows real roads.
+//
+// Uses the public OSRM demo server by default (free, rate-limited — fine for
+// low volume). For production reliability, self-host OSRM and set OSRM_BASE_URL.
+// Best-effort: any failure (timeout, NoMatch, server down) falls back to the
+// raw points for that segment, so the route is NEVER lost.
+const OSRM_BASE_URL = (process.env.OSRM_BASE_URL || 'https://router.project-osrm.org').replace(/\/+$/, '');
+
+async function osrmMatchChunk(points) {
+  if (typeof fetch !== 'function') return null;      // Node < 18
+  if (!Array.isArray(points) || points.length < 2) return null;
+  const coordStr = points.map(p => `${p.lng},${p.lat}`).join(';');
+  const radiuses = points.map(() => 30).join(';');   // 30 m GPS search radius per point
+  const url = `${OSRM_BASE_URL}/match/v1/driving/${coordStr}?geometries=geojson&overview=full&tidy=true&radiuses=${radiuses}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const r = await fetch(url, { signal: controller.signal });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (data.code !== 'Ok' || !Array.isArray(data.matchings) || !data.matchings.length) return null;
+    const coords = [];
+    let distanceM = 0;
+    for (const m of data.matchings) {
+      distanceM += Number(m?.distance) || 0;   // ROAD distance (m) of the matched trace
+      const g = m?.geometry?.coordinates;
+      if (Array.isArray(g)) for (const c of g) coords.push({ lat: c[1], lng: c[0] });  // OSRM = [lng,lat]
+    }
+    return coords.length >= 2 ? { coords, distanceM } : null;
+  } catch {
+    return null;   // timeout / network / parse — caller falls back to raw
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// #466 — Clean a raw ping trace before road-matching + distance:
+//   • chronological order (defensive re-sort by recordedAt)
+//   • drop poor-accuracy fixes (> MATCH_MAX_ACCURACY_M) — bad GPS / indoor
+//   • drop near-duplicate consecutive points (< MATCH_MIN_STEP_M) — stationary
+//     drift and duplicate pings
+// This is what stops indoor wandering, poor GPS, and duplicate pings from ever
+// inflating the reimbursable km.
+const MATCH_MAX_ACCURACY_M = 100;   // ignore fixes worse than 100 m
+const MATCH_MIN_STEP_M     = 4;     // collapse jitter/dupes under 4 m
+const MATCH_MAX_LEG_M      = 50000; // ignore single-tick teleports (bad fix)
+function cleanTraceForMatching(pings) {
+  const rows = (pings || [])
+    .filter(p => Number.isFinite(p?.lat) && Number.isFinite(p?.lng))
+    .filter(p => p.accuracy == null || Number(p.accuracy) <= MATCH_MAX_ACCURACY_M)
+    .slice()
+    .sort((a, b) => new Date(a.recordedAt || a.t || 0) - new Date(b.recordedAt || b.t || 0));
+  const out = [];
+  for (const p of rows) {
+    const prev = out[out.length - 1];
+    if (!prev) { out.push(p); continue; }
+    const stepM = haversineKm(prev, p) * 1000;
+    if (stepM >= MATCH_MIN_STEP_M) out.push(p);   // drop stationary jitter / dupes
+  }
+  return out;
+}
+
+// #466 — CANONICAL road distance + snapped path for a day's pings. Used by BOTH
+// adminDailyRoute (HRMS route modal) AND buildDailyRoute (Daily-Routes list +
+// ERM mobile + petrol billing), so every surface reports the SAME km, computed
+// from the OSRM road-matched route — never a straight-line sum.
+//   Returns { path:[{lat,lng}], distanceKm, source }
+//   source: 'osrm' (road-matched), 'gps' (haversine fallback), 'none'.
+// Efficient for long routes: chunks of 90 points (~11 OSRM calls for 1000
+// pings), 1-point overlap for continuity, per-chunk fallback so a single
+// failed/timed-out chunk never loses the segment or inflates the total.
+async function roadSnapAndMeasure(rawPings) {
+  const clean = cleanTraceForMatching(rawPings);
+  if (clean.length < 2) {
+    return { path: clean.map(p => ({ lat: p.lat, lng: p.lng })), distanceKm: 0, source: clean.length ? 'gps' : 'none' };
+  }
+  const CHUNK = 90;
+  const path = [];
+  let meters = 0;
+  let anyMatched = false;
+  for (let i = 0; i < clean.length; i += CHUNK) {
+    const start = i === 0 ? 0 : i - 1;               // 1-point overlap for continuity
+    const chunk = clean.slice(start, i + CHUNK);
+    if (chunk.length < 2) continue;
+    const m = await osrmMatchChunk(chunk);
+    if (m) {
+      anyMatched = true;
+      meters += m.distanceM;                         // OSRM road distance
+      path.push(...m.coords);
+    } else {
+      // Fallback for this chunk: haversine with jitter + teleport guards so a
+      // failed match never inflates (bad legs dropped) nor loses the segment.
+      for (let j = 1; j < chunk.length; j++) {
+        const legM = haversineKm(chunk[j - 1], chunk[j]) * 1000;
+        if (legM >= MATCH_MIN_STEP_M && legM < MATCH_MAX_LEG_M) meters += legM;
+      }
+      path.push(...chunk.map(p => ({ lat: p.lat, lng: p.lng })));
+    }
+  }
+  return {
+    path: path.length >= 2 ? path : clean.map(p => ({ lat: p.lat, lng: p.lng })),
+    distanceKm: Math.round((meters / 1000) * 100) / 100,
+    source: anyMatched ? 'osrm' : 'gps',
+  };
+}
+
 exports.adminDailyRoute = async (req, res) => {
   const expected = (process.env.ADMIN_SECRET || '').trim();
   const got      = (req.headers['x-admin-secret'] || '').trim();
@@ -2498,29 +2619,18 @@ exports.adminDailyRoute = async (req, res) => {
       .select('lat lng recordedAt accuracy speed')
       .lean();
 
-    // Total km via Haversine along consecutive points. Matches the
-    // formula used by the petrol auto-bill so the two stay in sync.
-    // #426 — Also drop legs < 5 m (residual GPS jitter) and legs > 50 km
-    // (single-tick teleports that indicate a bad fix). This matches the
-    // frontend polylineKm() thresholds so both sides converge on the same
-    // number when the client re-derives from the returned polyline.
-    const distMeters = (a, b) => {
-      const R = 6371000;
-      const toRad = d => d * Math.PI / 180;
-      const dLat = toRad(b.lat - a.lat);
-      const dLng = toRad(b.lng - a.lng);
-      const s = Math.sin(dLat / 2) ** 2 +
-                Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-      return 2 * R * Math.asin(Math.sqrt(s));
-    };
-    const MIN_LEG_M = 5;
-    const MAX_LEG_M = 50_000;
-    let totalM = 0;
-    for (let i = 1; i < pings.length; i++) {
-      const legM = distMeters(pings[i - 1], pings[i]);
-      if (legM >= MIN_LEG_M && legM < MAX_LEG_M) totalM += legM;
-    }
     const route = pings.map(p => ({ lat: p.lat, lng: p.lng, t: p.recordedAt }));
+
+    // #466 — ROAD-ACCURATE DISTANCE. Both the drawn polyline AND the total km
+    // now come from the SAME canonical OSRM road-matcher, so the reimbursable
+    // distance is the actual road-travel distance (not a straight-line sum) and
+    // is identical to what buildDailyRoute() returns to the list / petrol /
+    // mobile. On OSRM failure it falls back to a guarded haversine (jitter +
+    // teleport legs dropped) so it never inflates.
+    const measured = await roadSnapAndMeasure(pings);
+    const drawPath = (measured.path && measured.path.length >= 2) ? measured.path : route;
+    const totalM   = measured.distanceKm * 1000;
+
     const fullName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim() || 'Unknown';
 
     // #441 — Expose the TRUE total pings collected for the day (every row,
@@ -2545,12 +2655,16 @@ exports.adminDailyRoute = async (req, res) => {
         email: user.email || '',
       },
       date,
+      // #465 — `route` stays the RAW points (carry timestamps, used for any
+      // per-point logic); `polyline`/`points` carry the ROAD-SNAPPED path that
+      // the HRMS map actually draws, so the line follows roads.
       route,
-      // Frontend looks for several field names from older versions of
-      // this endpoint; emit ALL of them so the existing HRMS bundle and
-      // RouteMapModal both render without a redeploy.
-      polyline: route,
-      points:   route,
+      rawRoute: route,
+      // Frontend draws `polyline` first (then route, then points); feed it the
+      // snapped path so the drawn line follows roads. Falls back to raw when
+      // snapping fails.
+      polyline: drawPath,
+      points:   drawPath,
       // #441 — Ping-count breakdown for the "PINGS" card (names match what
       // RouteMapModal.jsx already reads: pingCount, movingPings, anchorPings).
       pingCount:  totalPings,     // ALL pings stored for the day (e.g. 24)
@@ -2558,8 +2672,10 @@ exports.adminDailyRoute = async (req, res) => {
       movingPings,                // non-anchor pings (e.g. 20)
       routePings: route.length,   // non-anchor, in-window points actually drawn
       anchorPings,                // stationary echoes excluded from the route
-      // #441 — Source label for the modal's "Source" card (was showing "—").
-      distanceSource: route.length >= 2 ? 'gps' : (totalPings > 0 ? 'gps' : 'no-pings'),
+      // #466 — Source label: 'osrm' when the km came from the road-matched
+      // route, 'gps' when it fell back to guarded haversine, else no-pings.
+      distanceSource: measured.source === 'osrm' ? 'osrm-road'
+                     : (route.length >= 2 ? 'gps' : (totalPings > 0 ? 'gps' : 'no-pings')),
       totalKm:         Number((totalM / 1000).toFixed(2)),
       totalDistanceKm: Number((totalM / 1000).toFixed(2)),
     });
@@ -2998,6 +3114,46 @@ exports.syncMissingPings = async (req, res) => {
     }
     const confirmedSet   = new Set(confirmedBuckets);
     const missingBuckets = allBuckets.filter(b => !confirmedSet.has(b));
+
+    // #460 — LIVE-MAP FRESHNESS. HRMS "Live Tracking" reads User.lastLocation,
+    // which historically was updated ONLY by the realtime /location-ping path
+    // and check-in/out. But with the RNBG tracker, pings reach the server
+    // through THIS batch endpoint — so the route history in LocationPing grew
+    // to 17:02 while User.lastLocation stayed frozen at the last realtime ping
+    // (16:52), leaving the live map stale. Fix: after a successful batch, push
+    // the NEWEST ping in this batch into User.lastLocation (+ presence active),
+    // but only if it's actually newer than what's already stored, so an
+    // out-of-order retry can't move the marker backwards.
+    try {
+      const newest = parsed[parsed.length - 1]; // parsed is sorted oldest→newest
+      if (newest && confirmedSet.has(newest.bucket)) {
+        await User.updateOne(
+          {
+            _id: userId,
+            $or: [
+              { 'lastLocation.updatedAt': { $lt: newest.recordedAt } },
+              { 'lastLocation.updatedAt': { $exists: false } },
+              { lastLocation: { $exists: false } },
+            ],
+          },
+          {
+            $set: {
+              presence: 'active',
+              lastSeenAt: new Date(),
+              lastLocation: {
+                lat: newest.lat,
+                lng: newest.lng,
+                accuracy: newest.accuracy ?? null,
+                stationary: newest.isStationary === true,
+                updatedAt: newest.recordedAt,
+              },
+            },
+          }
+        );
+      }
+    } catch (e) {
+      console.warn('[missing-pings] lastLocation update failed (non-fatal):', e?.message || e);
+    }
 
     console.log(
       `[missing-pings] ${empId} DONE received=${raw.length} parsed=${parsed.length} ` +

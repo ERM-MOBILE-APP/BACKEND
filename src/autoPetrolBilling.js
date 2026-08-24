@@ -63,9 +63,35 @@ function haversineKm(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-/* Walk every LocationPing for (user, date) and sum the polyline length. */
+/* #466 — Petrol distance MUST equal the HRMS / mobile / list distance, or
+   employees get reimbursed on a different number than HR sees. So this now
+   delegates to the CANONICAL buildDailyRoute() (OSRM road-matched distance)
+   instead of summing straight-line haversine legs. The lazy require avoids any
+   module-load cycle with the controller. On failure it falls back to the old
+   haversine sum as a safety net so billing is never blocked. */
 async function gpsDistanceKm(userId, dateStr, opts) {
   opts = opts || {};
+
+  // Primary: canonical road distance (identical to every other surface).
+  try {
+    const { buildDailyRoute } = require('./controllers/attendanceController');
+    const route = await buildDailyRoute(userId, dateStr, {
+      checkIn:  opts.checkIn,
+      checkOut: opts.checkOut,
+    });
+    if (route) {
+      return {
+        km:     Number(route.distanceKm) || 0,
+        source: route.source || 'gps',
+        from:   route.from || null,
+        to:     route.to   || null,
+      };
+    }
+  } catch (e) {
+    console.warn('[autoPetrolBilling] road distance failed — falling back to haversine:', e.message);
+  }
+
+  // Fallback (only if buildDailyRoute threw): original straight-line sum.
   const q = { user: userId, date: dateStr };
   if (opts.checkIn || opts.checkOut) {
     q.recordedAt = {};

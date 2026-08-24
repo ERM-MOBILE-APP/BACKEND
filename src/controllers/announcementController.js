@@ -69,7 +69,19 @@ exports.list = async (req, res) => {
     // array) and inject it on the response. Strip the (potentially
     // large) readBy array before sending so the wire payload stays slim.
     const meId = req.user && req.user.id ? String(req.user.id) : '';
-    const shaped = items.map((r) => {
+    // ── Team-scoped announcements (manager posts) ─────────────────────
+    // A manager can post an announcement to ONLY their direct team
+    // (audience:'team' + audienceUserIds snapshot). Those must never leak
+    // to the whole company, so filter them out here unless the current
+    // user is in the audience (or is the poster). 'all'/'department'/
+    // unset announcements are unaffected — everyone still sees them.
+    const visible = items.filter((r) => {
+      if (String(r.audience || 'all') !== 'team') return true;
+      const aud = Array.isArray(r.audienceUserIds) ? r.audienceUserIds.map(String) : [];
+      if (!meId) return false;
+      return aud.includes(meId) || String(r.postedByUser || '') === meId;
+    });
+    const shaped = visible.map((r) => {
       const readBy = Array.isArray(r.readBy) ? r.readBy.map(String) : [];
       const isRead = meId ? readBy.includes(meId) : false;
       const { readBy: _omit, ...rest } = r;
