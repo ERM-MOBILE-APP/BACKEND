@@ -77,7 +77,14 @@ exports.list = async (req, res) => {
     // So the Home feed here shows only 'all' / 'department' (HR/company)
     // announcements. This also fixes the "Posted by HR" mislabel that
     // appeared when a manager post surfaced on Home.
-    const visible = items.filter((r) => String(r.audience || 'all') !== 'team');
+    // Exclude BOTH team-scoped audience values from the general feed:
+    // 'team' (posted from ERM mobile) and 'manager-team' (posted from ERM
+    // web). Manager announcements belong only in the Manager Announcements
+    // screen; team members are informed via the bell/push, not this feed.
+    const visible = items.filter((r) => {
+      const aud = String(r.audience || 'all');
+      return aud !== 'team' && aud !== 'manager-team';
+    });
     const shaped = visible.map((r) => {
       const readBy = Array.isArray(r.readBy) ? r.readBy.map(String) : [];
       const isRead = meId ? readBy.includes(meId) : false;

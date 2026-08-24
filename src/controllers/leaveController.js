@@ -365,9 +365,41 @@ exports.adminListAll = async (req, res) => {
     if (type === 'leave' || type === 'permission') q.requestType = type;
     if (['pending', 'approved', 'rejected'].includes(status)) q.status = status;
 
-    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+    // #472 — OPTIONAL date-range filter keyed on the leave's OWN dates
+    // (startDate/endDate for leave, date for permission) — NOT createdAt /
+    // reviewedAt / approval time. This fixes the HRMS calendar dropping an
+    // approved request from its requested date: previously this endpoint
+    // returned only the 200 most-recently-CREATED approved rows, so a leave
+    // requested for a past date (created earlier) fell below the cutoff and
+    // vanished from the calendar once ~200 newer requests existed. When a
+    // from/to range is supplied, we match by the requested date and lift the
+    // cap so every request overlapping the viewed month is returned,
+    // regardless of when it was created or approved.
+    const from = String(req.query.from || '').slice(0, 10);
+    const to   = String(req.query.to   || '').slice(0, 10);
+    const hasRange =
+      /^\d{4}-\d{2}-\d{2}$/.test(from) && /^\d{4}-\d{2}-\d{2}$/.test(to);
 
-    const items = await Leave.find(q)
+    let query = q;
+    if (hasRange) {
+      const dateOr = {
+        $or: [
+          // A leave covers the range if it starts on/before `to` and ends on/after `from`.
+          { requestType: 'leave',      startDate: { $lte: to }, endDate: { $gte: from } },
+          // A permission lands in the range if its date is within [from, to].
+          { requestType: 'permission', date: { $gte: from, $lte: to } },
+        ],
+      };
+      query = Object.keys(q).length ? { $and: [q, dateOr] } : dateOr;
+    }
+
+    // With an explicit range, return everything in it (high cap) so nothing
+    // is dropped; without a range, keep the legacy recent-N behaviour.
+    const limit = hasRange
+      ? Math.min(parseInt(req.query.limit, 10) || 2000, 5000)
+      : Math.min(parseInt(req.query.limit, 10) || 200, 500);
+
+    const items = await Leave.find(query)
       .populate('user', 'userId employeeId firstName lastName name email designation photoUrl department designationTitle departmentName')
       .sort({ createdAt: -1 })
       .limit(limit)

@@ -1117,7 +1117,13 @@ async function computeMonthlySummary(userId, month, year) {
     const today = new Date();
     const isCurrentMonth =
       today.getFullYear() === year && today.getMonth() + 1 === month;
-    const upTo = isCurrentMonth ? today.getDate() : lastDay;
+    // #471 — A future month has NOT elapsed, so no workdays have passed yet.
+    // Without this, requesting (say) Sep before it starts counted every
+    // future weekday as Absent. upTo=0 → workdays=0 → absent=0, present=0.
+    const isFutureMonth =
+      (year > today.getFullYear()) ||
+      (year === today.getFullYear() && month > today.getMonth() + 1);
+    const upTo = isFutureMonth ? 0 : (isCurrentMonth ? today.getDate() : lastDay);
     let workdays = 0;
     let holidayBonus = 0;
     for (let d = 1; d <= upTo; d++) {
@@ -2149,7 +2155,7 @@ exports.adminLiveLocations = async (req, res) => {
     //       appear on the live map any more
     //   (b) surface check-in time + worked-so-far on each row
     const todayAtt = await Attendance.find({ date: todayIso })
-      .select('user checkIn checkOut workedHours')
+      .select('user checkIn checkOut workedHours checkInLat checkInLng')
       .lean();
     const attByUser = new Map();
     for (const a of todayAtt) attByUser.set(String(a.user), a);
@@ -2161,6 +2167,17 @@ exports.adminLiveLocations = async (req, res) => {
       if (!att || !att.checkIn || att.checkOut) {
         return null;
       }
+
+      // #473 — WHERE did the employee CHECK IN? If the check-in coords fall
+      // inside the office geofence → "Office"; otherwise the frontend
+      // reverse-geocodes these coords to a place name. This is the check-in
+      // location, independent of their current live position.
+      const ciLat = (typeof att.checkInLat === 'number') ? att.checkInLat : null;
+      const ciLng = (typeof att.checkInLng === 'number') ? att.checkInLng : null;
+      const checkInIsOffice =
+        (ciLat != null && ciLng != null)
+          ? distMeters(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
+          : false;
 
       let lat = null, lng = null, speed = null, recordedAt = null, accuracy = null;
       try {
@@ -2221,6 +2238,9 @@ exports.adminLiveLocations = async (req, res) => {
             dept:       deptLabel0,
             lat, lng, speed, accuracy,
             status, site,
+            checkInLat: ciLat,
+            checkInLng: ciLng,
+            checkInIsOffice,
             lastSeen:   recordedAt,
             route:      null,
           };
@@ -2323,6 +2343,9 @@ exports.adminLiveLocations = async (req, res) => {
         movement,
         route,
         checkInAt:  att.checkIn,
+        checkInLat: ciLat,
+        checkInLng: ciLng,
+        checkInIsOffice,
         lastSeen:   recordedAt,
       };
     }));
