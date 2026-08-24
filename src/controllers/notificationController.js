@@ -1,4 +1,58 @@
 const Notification = require('../models/Notification');
+const User = require('../models/User');
+const DeviceToken = require('../models/DeviceToken');
+
+// POST /api/notification/register-device   { token, platform?, deviceId? }
+// Store the device's FCM registration token against the LOGGED-IN user so the
+// backend (via firebase-admin) can push to it. Upsert on `token` so:
+//   • re-registering the same token just refreshes lastUsedAt (no duplicates),
+//   • a shared device is reassigned to whoever is currently logged in.
+exports.registerDevice = async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    if (!token) return res.status(400).json({ message: 'token is required.' });
+    const platform = String(req.body?.platform || 'android').trim().toLowerCase();
+    const deviceId = String(req.body?.deviceId || '').trim();
+
+    let role = 'employee';
+    try {
+      const u = await User.findById(req.user.id).select('role').lean();
+      role = (u && u.role) || 'employee';
+    } catch { /* default role */ }
+
+    await DeviceToken.findOneAndUpdate(
+      { token },
+      {
+        $set: {
+          user: req.user.id,
+          role,
+          platform,
+          deviceId,
+          lastUsedAt: new Date(),
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[notification.registerDevice]', err.message);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+// POST /api/notification/unregister-device   { token }
+// Detach a device from the current user (call on logout).
+exports.unregisterDevice = async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    if (!token) return res.status(400).json({ message: 'token is required.' });
+    await DeviceToken.deleteOne({ token, user: req.user.id });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[notification.unregisterDevice]', err.message);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
 
 // GET /api/notification?limit=&onlyUnread=
 exports.list = async (req, res) => {

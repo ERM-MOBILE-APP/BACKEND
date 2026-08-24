@@ -83,6 +83,9 @@ const userSchema = new mongoose.Schema(
       updatedAt: { type: Date,   default: null },
     },
     lastSeenAt:   { type: Date, default: null },   // last time the mobile pinged
+    // NOTE: FCM device tokens are stored in the separate DeviceToken
+    // collection (models/DeviceToken.js), not on the User, so one user can
+    // have many devices and invalid tokens can be pruned independently.
   },
   {
     collection: 'employees',   // ← points at the SAME collection HRMS uses

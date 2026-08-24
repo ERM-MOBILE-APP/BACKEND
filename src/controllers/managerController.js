@@ -422,6 +422,7 @@ exports.actAllowance = async (req, res) => {
         title: `Allowance ${doc.managerStatus.toLowerCase()} by your manager`,
         body:  bodyLine,
         type:  'allowance',
+        link:  '/(tabs)/allowance',
       });
     } catch (e) {
       console.warn('[manager.actAllowance] notify failed:', e.message);
