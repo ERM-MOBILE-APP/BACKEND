@@ -1053,7 +1053,24 @@ const isHolidayISO = (iso) => HOLIDAYS.has(iso);
 // status). That guaranteed HRMS and the ERM attendance cards would disagree.
 // Both now read this single function, so the two screens agree by construction
 // instead of by coincidence.
+// #474 — ERM went live on this date. No attendance/report may count any
+// month before it (records before this don't reflect real ERM usage). Single
+// source of truth for the whole backend — change here to shift the start.
+const ERM_START_YEAR = 2026;
+const ERM_START_MONTH = 7; // July  → ERM_START_DATE = 2026-07-01
+function isBeforeErmStart(month, year) {
+  return (year < ERM_START_YEAR) || (year === ERM_START_YEAR && month < ERM_START_MONTH);
+}
+exports.isBeforeErmStart = isBeforeErmStart;
+exports.ERM_START = { year: ERM_START_YEAR, month: ERM_START_MONTH, date: '2026-07-01' };
+
 async function computeMonthlySummary(userId, month, year) {
+  // Months before the ERM start date have no valid data — return zeros
+  // WITHOUT querying, so pre-July-2026 records can never surface.
+  if (isBeforeErmStart(month, year)) {
+    return { present: 0, absent: 0, late: 0, permission: 0, halfday: 0, leave: 0,
+             holiday: 0, totalDays: 0, workdaysElapsed: 0 };
+  }
   const { start, end } = monthBounds(month, year);
 
   const records = await Attendance.find({
@@ -2415,6 +2432,32 @@ exports.adminDailyRoutesList = async (req, res) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ message: 'date=YYYY-MM-DD required' });
     }
+
+    // #473 — Resolve the office anchor so we can label each check-in as
+    // "Office" (within the geofence) vs a field location. Mirrors
+    // adminLiveLocations: SystemConfig-locked anchor wins, else env, else code.
+    let OFFICE_LAT = parseFloat(process.env.OFFICE_LAT || '13.0412');
+    let OFFICE_LNG = parseFloat(process.env.OFFICE_LNG || '80.2127');
+    let OFFICE_RADIUS_M = parseFloat(process.env.OFFICE_RADIUS_M || '60');
+    try {
+      const SystemConfig = require('../models/SystemConfig');
+      if (SystemConfig) {
+        const cfg = await SystemConfig.findOne({}).lean();
+        const anchor = cfg && cfg.officeAnchor;
+        if (anchor && typeof anchor.lat === 'number' && typeof anchor.lng === 'number') {
+          OFFICE_LAT = anchor.lat;
+          OFFICE_LNG = anchor.lng;
+          if (typeof anchor.radiusM === 'number') OFFICE_RADIUS_M = anchor.radiusM;
+        }
+      }
+    } catch { /* fall back to env/code defaults */ }
+    const distM = (la1, lo1, la2, lo2) => {
+      const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+      const dLa = toRad(la2 - la1), dLo = toRad(lo2 - lo1);
+      const x = Math.sin(dLa / 2) ** 2 +
+        Math.cos(toRad(la1)) * Math.cos(toRad(la2)) * Math.sin(dLo / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(x));
+    };
     // Every attendance record on this date — that's our "did this
     // employee work today" set. We populate the user for the name +
     // employeeId sidecar.
@@ -2458,6 +2501,12 @@ exports.adminDailyRoutesList = async (req, res) => {
         ((u.firstName || '') + ' ' + (u.lastName || '')).trim() ||
         '—';
       const allow = allowByUser.get(String(u._id || a.user));
+      const ciLat = (typeof a.checkInLat === 'number') ? a.checkInLat : null;
+      const ciLng = (typeof a.checkInLng === 'number') ? a.checkInLng : null;
+      const checkInIsOffice =
+        (ciLat != null && ciLng != null)
+          ? distM(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
+          : false;
       return {
         _id:         String(u._id || a.user),
         employeeId:  u.employeeId || '',
@@ -2471,6 +2520,10 @@ exports.adminDailyRoutesList = async (req, res) => {
         status:      a.status   || '',
         distanceKm:  route.distanceKm,
         source:      route.source,
+        // Where the employee checked in (for the "Checked-in Location" column).
+        checkInLat:  ciLat,
+        checkInLng:  ciLng,
+        checkInIsOffice,
         hasAllowance: !!allow,
         allowanceStatus: allow ? allow.status : '',
       };
