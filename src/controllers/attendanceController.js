@@ -2202,7 +2202,7 @@ exports.adminLiveLocations = async (req, res) => {
     //       appear on the live map any more
     //   (b) surface check-in time + worked-so-far on each row
     const todayAtt = await Attendance.find({ date: todayIso })
-      .select('user checkIn checkOut workedHours checkInLat checkInLng location')
+      .select('user checkIn checkOut workedHours checkInLat checkInLng')
       .lean();
     const attByUser = new Map();
     for (const a of todayAtt) attByUser.set(String(a.user), a);
@@ -2219,17 +2219,35 @@ exports.adminLiveLocations = async (req, res) => {
       // inside the office geofence → "Office"; otherwise the frontend
       // reverse-geocodes these coords to a place name. This is the check-in
       // location, independent of their current live position.
-      const ciLat = (typeof att.checkInLat === 'number') ? att.checkInLat : null;
-      const ciLng = (typeof att.checkInLng === 'number') ? att.checkInLng : null;
+      // WHERE did the employee CHECK IN? Ground truth is the GPS captured at
+      // the check-in tap. If that's present we use it directly.
+      let ciLat = (typeof att.checkInLat === 'number') ? att.checkInLat : null;
+      let ciLng = (typeof att.checkInLng === 'number') ? att.checkInLng : null;
+      let checkInApprox = false;
+      // #473c — If check-in captured NO GPS (cold GPS fix at the tap, or
+      // location briefly off), DON'T guess from the app's office/remote
+      // toggle — that toggle defaults to 'office' and produced a false
+      // "Office" for employees who actually started remote. Instead fall
+      // back to the employee's EARLIEST real ping of the day, which is an
+      // honest proxy for where they were at the start of the shift.
+      if (ciLat == null || ciLng == null) {
+        try {
+          const firstPing = await LocationPing.findOne({ user: u._id, date: todayIso })
+            .sort({ recordedAt: 1 })
+            .select('lat lng')
+            .lean();
+          if (firstPing && typeof firstPing.lat === 'number' && typeof firstPing.lng === 'number') {
+            ciLat = firstPing.lat;
+            ciLng = firstPing.lng;
+            checkInApprox = true; // derived from first ping, not the check-in tap
+          }
+        } catch { /* no pings collection / none today */ }
+      }
+      // Office ONLY when real coords fall inside the geofence.
       const checkInIsOffice =
         (ciLat != null && ciLng != null)
           ? distMeters(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
           : false;
-      // #473b — declared check-in MODE ('office' | 'remote'), the toggle the
-      // employee picked in the app. Used by the frontend as a fallback label
-      // when GPS coords weren't captured at check-in (location off / no fix),
-      // so HR sees the declared place instead of a bare "—".
-      const checkInMode = String(att.location || '').toLowerCase();
 
       let lat = null, lng = null, speed = null, recordedAt = null, accuracy = null;
       try {
@@ -2293,7 +2311,7 @@ exports.adminLiveLocations = async (req, res) => {
             checkInLat: ciLat,
             checkInLng: ciLng,
             checkInIsOffice,
-            checkInMode,
+            checkInApprox,
             lastSeen:   recordedAt,
             route:      null,
           };
@@ -2399,7 +2417,7 @@ exports.adminLiveLocations = async (req, res) => {
         checkInLat: ciLat,
         checkInLng: ciLng,
         checkInIsOffice,
-        checkInMode,
+        checkInApprox,
         lastSeen:   recordedAt,
       };
     }));
