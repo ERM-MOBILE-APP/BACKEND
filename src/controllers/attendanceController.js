@@ -1379,32 +1379,60 @@ exports.createRequest = async (req, res) => {
   }
 };
 
-// Auto-expire pending attendance requests older than 2 days. Runs on
-// every list call (cheap: indexed query, updateMany once) so HR doesn't
-// see a request that's effectively been ignored — and the employee can
-// re-file because the row is no longer "pending".
-async function closeStaleAttendanceRequests(filter = {}) {
-  const cutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+// ── Attendance-request lifecycle (Aug 2026 — sync fix #480) ──────────
+// PREVIOUS behaviour auto-WROTE status:'expired' into the shared
+// AttendanceRequest collection after 2 days. ERM Mobile, ERM Web and HRMS
+// all read this ONE collection, so that destructive write hid genuinely-
+// pending requests from HR/managers: the request vanished from HRMS even
+// though nobody had acted on it. That is the bug this replaces.
+//
+// The DB `status` is now the SINGLE SOURCE OF TRUTH and is NEVER auto-set
+// to 'expired':
+//   pending → pending     approved → approved     rejected → rejected
+// A pending request stays visible in HRMS/manager until a human actually
+// approves or rejects it, no matter how old it is.
+//
+// 'expired' was ONLY ever machine-set (humans only ever set approved /
+// rejected), so any legacy 'expired' row is a request that was auto-hidden
+// without a human decision. We self-heal those back to 'pending' so they
+// re-appear everywhere. Idempotent + indexed: once healed there are no
+// 'expired' rows left, so subsequent sweeps match nothing.
+async function reviveAutoExpiredRequests(filter = {}) {
   try {
     await AttendanceRequest.updateMany(
-      { ...filter, status: 'pending', createdAt: { $lt: cutoff } },
-      { $set: { status: 'expired' } }
+      { ...filter, status: 'expired' },
+      { $set: { status: 'pending' } }
     );
   } catch (e) {
-    // Sweep failure is non-fatal — the list still returns, just with
-    // stale rows still marked pending. Log and move on.
-    console.warn('[attendance.request] sweep failed:', e.message);
+    // Non-fatal — the list still returns; log and move on.
+    console.warn('[attendance.request] revive sweep failed:', e.message);
   }
 }
 
-// GET /api/attendance/requests
+// ERM MOBILE ONLY — display-only 2-day rule. A still-pending request older
+// than this is shown to the EMPLOYEE (in the ERM app) as "expired" so they
+// can re-file, but the DB row is NOT touched — HRMS/manager keep seeing it
+// as genuinely pending. Computed at read time, never persisted.
+const ERM_REQUEST_EXPIRY_DAYS = 2;
+function isErmDisplayExpired(row) {
+  if (!row || row.status !== 'pending' || !row.createdAt) return false;
+  const cutoff = Date.now() - ERM_REQUEST_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+  return new Date(row.createdAt).getTime() < cutoff;
+}
+
+// GET /api/attendance/requests  (ERM Mobile — employee's own requests)
 exports.listRequests = async (req, res) => {
   try {
-    await closeStaleAttendanceRequests({ user: req.user.id });
+    // Undo any legacy auto-expiry so the employee sees the true status.
+    await reviveAutoExpiredRequests({ user: req.user.id });
     const items = await AttendanceRequest.find({ user: req.user.id })
       .sort({ createdAt: -1 })
       .lean();
-    res.json(items);
+    // Annotate (do NOT persist) the ERM display-only 2-day expiry so the
+    // app can show old pending requests as expired + let the employee
+    // re-file, while the DB row remains 'pending' for HRMS/manager.
+    const out = items.map((it) => ({ ...it, expired: isErmDisplayExpired(it) }));
+    res.json(out);
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
@@ -1425,7 +1453,9 @@ exports.adminListRequests = async (req, res) => {
   if (!expected) return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
   if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
   try {
-    await closeStaleAttendanceRequests({});
+    // Never auto-expire. Only self-heal legacy machine-expired rows so old
+    // still-pending requests re-appear for HR/managers. DB status is truth.
+    await reviveAutoExpiredRequests({});
     const filter = {};
     const status = String(req.query.status || '').toLowerCase();
     if (['pending', 'approved', 'rejected', 'expired'].includes(status)) {
@@ -2172,7 +2202,7 @@ exports.adminLiveLocations = async (req, res) => {
     //       appear on the live map any more
     //   (b) surface check-in time + worked-so-far on each row
     const todayAtt = await Attendance.find({ date: todayIso })
-      .select('user checkIn checkOut workedHours checkInLat checkInLng')
+      .select('user checkIn checkOut workedHours checkInLat checkInLng location')
       .lean();
     const attByUser = new Map();
     for (const a of todayAtt) attByUser.set(String(a.user), a);
@@ -2195,6 +2225,11 @@ exports.adminLiveLocations = async (req, res) => {
         (ciLat != null && ciLng != null)
           ? distMeters(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
           : false;
+      // #473b — declared check-in MODE ('office' | 'remote'), the toggle the
+      // employee picked in the app. Used by the frontend as a fallback label
+      // when GPS coords weren't captured at check-in (location off / no fix),
+      // so HR sees the declared place instead of a bare "—".
+      const checkInMode = String(att.location || '').toLowerCase();
 
       let lat = null, lng = null, speed = null, recordedAt = null, accuracy = null;
       try {
@@ -2258,6 +2293,7 @@ exports.adminLiveLocations = async (req, res) => {
             checkInLat: ciLat,
             checkInLng: ciLng,
             checkInIsOffice,
+            checkInMode,
             lastSeen:   recordedAt,
             route:      null,
           };
@@ -2363,6 +2399,7 @@ exports.adminLiveLocations = async (req, res) => {
         checkInLat: ciLat,
         checkInLng: ciLng,
         checkInIsOffice,
+        checkInMode,
         lastSeen:   recordedAt,
       };
     }));

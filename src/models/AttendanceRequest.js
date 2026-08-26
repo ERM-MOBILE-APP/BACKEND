@@ -20,9 +20,15 @@ const attendanceRequestSchema = new mongoose.Schema(
     expectedCheckIn: { type: String, default: '' }, // "HH:mm"
     expectedCheckOut: { type: String, default: '' },
     status: {
-      // 'expired' is set automatically when a pending request has been
-      // sitting for 2+ days without HR action — keeps the queue from
-      // growing forever and matches the policy HR asked for.
+      // SOURCE OF TRUTH. Only ever set by a human decision:
+      //   pending → approved | rejected.
+      // 'expired' is DEPRECATED (kept in the enum only so any legacy rows
+      // still validate). It is NEVER written automatically any more — the
+      // old 2-day auto-expiry corrupted the shared record and hid genuinely-
+      // pending requests from HRMS/managers (see attendanceController
+      // #480). A pending request stays pending until a human acts, however
+      // old it is. ERM Mobile's 2-day "expired" is now a display-only,
+      // computed flag (see isErmDisplayExpired) and does not touch the DB.
       type: String,
       enum: ['pending', 'approved', 'rejected', 'expired'],
       default: 'pending',
