@@ -1752,16 +1752,12 @@ exports.locationPing = async (req, res) => {
     // positions sometimes have a slightly looser radius). Anything
     // wider gets the live presence updated but NOT polylined.
     const accNum = typeof accuracy === 'number' ? accuracy : null;
-    // #310 — Tightened from 50m → 35m to match the mobile anti-jitter
-    // filter (services/locationTask.ts ACCURACY_GATE_M = 30m, plus a
-    // 5m headroom for timestamp skew between the device clock and the
-    // server timestamp the filter uses). Before this change the backend
-    // accepted fixes the mobile filter would never even have sent,
-    // because the mobile WAS sending pre-filtered fixes but a manual
-    // checkin/checkout could still slip through at 50m. Now both ends
-    // gate at the same effective radius — every point that lands in
-    // the audit polyline is GPS-grade.
-    const acceptableAccuracy = accNum == null || accNum <= 35;
+    // #484 — NO ACCURACY GATE. Every successfully synced ping is stored and
+    // shown in HRMS regardless of GPS accuracy. The accuracy value (accNum)
+    // is preserved on the row for reference but is NEVER used to reject,
+    // filter, or hide a ping — including low-accuracy / anchor fixes and the
+    // latest ping. This guarantees HRMS always reflects the true latest ping
+    // and an unbroken 2-min trail, even on weak/indoor GPS.
     // isStationary flag from the mobile anti-jitter filter. When true,
     // the mobile sent the held anchor (not a fresh GPS reading) so the
     // polyline shouldn't be extended with what is effectively the same
@@ -1799,22 +1795,15 @@ exports.locationPing = async (req, res) => {
       },
     });
 
-    // 2) Append the audit ping — gated on accuracy AND on movement.
-    //    - Sub-quality samples (>50 m) never enter the polyline.
-    //    - Stationary samples (anchor echoes) update presence + the
-    //      "last seen" position on the user, but don't pollute the
-    //      polyline. This is what makes the marker stop drifting on
-    //      HR's map when an employee is standing still.
-    if (!acceptableAccuracy) {
-      return res.json({ ok: true, accepted: false, reason: 'accuracy>50m' });
-    }
-    // #375 — Stationary anchor echoes ARE recorded now (with isAnchor:true)
-    // so HR has an unbroken 2-min audit trail even during "parked at
-    // client" / "sitting at desk" periods. Distance/polyline queries
-    // filter these out. Previously we returned early here, which left
-    // multi-minute gaps in the DB even though the phone was pinging
-    // correctly — HR mistook the gaps for tracking failures.
-    // The row still goes through the 100-sec dedup gate below.
+    // 2) Append the audit ping — EVERY synced ping is recorded (#484),
+    //    regardless of GPS accuracy. Low-accuracy fixes are NO LONGER
+    //    dropped; the accuracy value is stored for reference but never used
+    //    to exclude a ping, so HRMS always shows the true latest ping and an
+    //    unbroken 2-min trail even on weak/indoor GPS.
+    //    Stationary anchor echoes are still flagged (isAnchor:true) so
+    //    distance/polyline math can de-emphasise them if needed — but they
+    //    are NOT hidden from HRMS. The row still goes through the per-bucket
+    //    dedup gate below (one row per 2-min window).
 
     // #379 — ATOMIC DEDUP via unique index on (user, date, bucket).
     // Bucket = floor(recordedAt_ms / 120000) → one slot per 2-min window.
