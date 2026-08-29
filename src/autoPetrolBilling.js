@@ -78,11 +78,20 @@ async function gpsDistanceKm(userId, dateStr, opts) {
     const route = await buildDailyRoute(userId, dateStr, {
       checkIn:  opts.checkIn,
       checkOut: opts.checkOut,
+      // #499 — forward the check-in/out pins so that even a day with no usable
+      // GPS trace gets the ROAD distance between those two points (OSRM /route)
+      // instead of a straight line.
+      checkInLat:  opts.checkInLat,  checkInLng:  opts.checkInLng,
+      checkOutLat: opts.checkOutLat, checkOutLng: opts.checkOutLng,
     });
     if (route) {
       return {
         km:     Number(route.distanceKm) || 0,
         source: route.source || 'gps',
+        // #499 — TRUE only when the distance came from OSRM road matching/
+        // routing. Petrol billing bills ONLY road-accurate distance; a
+        // straight-line value ('gps' haversine fallback / 'pins') is refused.
+        roadAccurate: route.source === 'osrm-road',
         from:   route.from || null,
         to:     route.to   || null,
       };
@@ -104,7 +113,7 @@ async function gpsDistanceKm(userId, dateStr, opts) {
     .select('lat lng recordedAt')
     .lean();
   if (pings.length < 2) {
-    return { km: 0, source: 'none', from: null, to: null };
+    return { km: 0, source: 'none', roadAccurate: false, from: null, to: null };
   }
   let total = 0;
   for (let i = 1; i < pings.length; i++) {
@@ -115,6 +124,8 @@ async function gpsDistanceKm(userId, dateStr, opts) {
   return {
     km: Math.round(total * 100) / 100,
     source: 'gps',
+    // Straight-line haversine — NOT road-accurate. Petrol billing refuses this.
+    roadAccurate: false,
     from: { lat: first.lat, lng: first.lng, at: first.recordedAt },
     to:   { lat: last.lat,  lng: last.lng,  at: last.recordedAt  },
   };
@@ -166,6 +177,18 @@ async function sweepOnce() {
             checkIn:  record.checkIn,
             checkOut: record.checkOut,
           });
+
+          // #499 — Petrol bills ROAD distance ONLY. When a real GPS trace
+          // exists but only a straight-line distance could be produced (OSRM
+          // momentarily unreachable), DEFER: don't create a straight-line row —
+          // leave it for a later sweep (every 5 min) to bill the true road km
+          // once OSRM responds. Rows are idempotent, so retrying is safe.
+          if (Number(dayRoute.km) > 0 && dayRoute.roadAccurate === false) {
+            skipped++;
+            const tag = raw.employeeId || raw.userId || String(raw._id);
+            console.warn(`[autoPetrolBilling] deferring ${tag} ${date} — road distance unavailable (OSRM), will retry next sweep`);
+            continue;
+          }
 
           let km      = 0;
           let source  = 'none';

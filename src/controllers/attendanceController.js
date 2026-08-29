@@ -247,11 +247,28 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
     };
   }
 
-  // Fallback: straight line between checkIn/checkOut coords if both exist.
+  // Fallback: only check-in + check-out coords exist (no usable trace).
   if (opts.checkInLat != null && opts.checkInLng != null &&
       opts.checkOutLat != null && opts.checkOutLng != null) {
     const a = { lat: opts.checkInLat,  lng: opts.checkInLng  };
     const b = { lat: opts.checkOutLat, lng: opts.checkOutLng };
+
+    // #499 — Even with just two points, get the ROAD distance between them via
+    // OSRM /route instead of a straight line across the map. Only if OSRM is
+    // unreachable do we fall back to the straight-line haversine (flagged
+    // 'pins' so petrol billing can retry later rather than bill a straight line).
+    const rt = await osrmRouteChunk([a, b]);
+    if (rt) {
+      return {
+        distanceKm: Math.round((rt.distanceM / 1000) * 100) / 100,
+        source:     'osrm-road',
+        polyline:   (rt.coords || [a, b]).map((p) => ({ lat: p.lat, lng: p.lng })),
+        from: { lat: a.lat, lng: a.lng, at: opts.checkIn  || null },
+        to:   { lat: b.lat, lng: b.lng, at: opts.checkOut || null },
+        pingCount: 0, movingPings: 0, anchorPings: 0,
+      };
+    }
+
     const km = haversineKm(a, b);
     return {
       distanceKm: Math.round(km * 100) / 100,
@@ -262,6 +279,7 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
       ],
       from: { lat: a.lat, lng: a.lng, at: opts.checkIn  || null },
       to:   { lat: b.lat, lng: b.lng, at: opts.checkOut || null },
+      pingCount: 0, movingPings: 0, anchorPings: 0,
     };
   }
   return empty;
@@ -657,6 +675,13 @@ exports.checkOut = async (req, res) => {
 
           if (already) {
             console.log(`${LOG} skip ${userTag}: row already exists (_id=${already._id})`);
+          } else if (dayRoute && Number(dayRoute.distanceKm) > 0 && dayRoute.source !== 'osrm-road') {
+            // #499 — A real GPS trace exists but only a STRAIGHT-LINE distance
+            // could be produced (OSRM momentarily unreachable). Do NOT bill a
+            // straight-line number at check-out. Leave the row uncreated so the
+            // 5-min auto-biller sweep bills the TRUE road distance once OSRM
+            // responds (rows are idempotent, so the retry is safe).
+            console.log(`${LOG} defer ${userTag}: road distance unavailable (source=${dayRoute.source}); auto-biller will retry`);
           } else {
             // Resolve distance through cascading fallbacks. Whichever
             // source produces > 0 wins. If they all return 0 we STILL
@@ -2737,6 +2762,47 @@ async function osrmMatchChunk(points) {
   }
 }
 
+// #499 — OSRM /route road distance between an ORDERED set of waypoints.
+//
+// Why this exists alongside /match:
+//   /match snaps a DENSE GPS trace onto roads. When pings are far apart (e.g.
+//   captured 2 min apart at speed, or just two points like check-in →
+//   check-out), /match often returns NoMatch and the caller was falling back
+//   to a STRAIGHT-LINE haversine sum — the very thing petrol billing must not
+//   use. /route computes the actual DRIVING route ALONG ROADS between the
+//   given waypoints regardless of how far apart they are, so we always get a
+//   realistic on-road distance instead of a line cutting across fields.
+//
+// Returns { coords:[{lat,lng}], distanceM } (road geometry + road metres) or
+// null on any failure so the caller can degrade gracefully.
+async function osrmRouteChunk(points) {
+  if (typeof fetch !== 'function') return null;      // Node < 18
+  if (!Array.isArray(points) || points.length < 2) return null;
+  const coordStr = points.map(p => `${p.lng},${p.lat}`).join(';');
+  const url = `${OSRM_BASE_URL}/route/v1/driving/${coordStr}?geometries=geojson&overview=full`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const r = await fetch(url, { signal: controller.signal });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (data.code !== 'Ok' || !Array.isArray(data.routes) || !data.routes.length) return null;
+    const route = data.routes[0];
+    const distanceM = Number(route?.distance) || 0;   // ROAD distance (m) along the driven route
+    const g = route?.geometry?.coordinates;
+    const coords = Array.isArray(g) ? g.map(c => ({ lat: c[1], lng: c[0] })) : [];  // OSRM = [lng,lat]
+    if (distanceM <= 0) return null;
+    return {
+      coords: coords.length >= 2 ? coords : points.map(p => ({ lat: p.lat, lng: p.lng })),
+      distanceM,
+    };
+  } catch {
+    return null;   // timeout / network / parse — caller falls back
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // #488 — Clean a raw ping trace before road-matching + distance so that GPS
 // DRIFT around a stationary employee never becomes a fake "travelled route".
 // Runs at compute time for BOTH the Daily-Routes list distance and the HRMS
@@ -2839,30 +2905,51 @@ async function roadSnapAndMeasure(rawPings) {
   const CHUNK = 90;
   const path = [];
   let meters = 0;
-  let anyMatched = false;
+  let roadChunks = 0;      // chunks measured on-road (via /match or /route)
+  let straightChunks = 0;  // chunks that fell all the way to straight-line
   for (let i = 0; i < clean.length; i += CHUNK) {
     const start = i === 0 ? 0 : i - 1;               // 1-point overlap for continuity
     const chunk = clean.slice(start, i + CHUNK);
     if (chunk.length < 2) continue;
+
+    // (1) Preferred: /match snaps the dense trace onto roads.
     const m = await osrmMatchChunk(chunk);
     if (m) {
-      anyMatched = true;
+      roadChunks++;
       meters += m.distanceM;                         // OSRM road distance
       path.push(...m.coords);
-    } else {
-      // Fallback for this chunk: haversine with jitter + teleport guards so a
-      // failed match never inflates (bad legs dropped) nor loses the segment.
-      for (let j = 1; j < chunk.length; j++) {
-        const legM = haversineKm(chunk[j - 1], chunk[j]) * 1000;
-        if (legM >= MATCH_MIN_STEP_M && legM < MATCH_MAX_LEG_M) meters += legM;
-      }
-      path.push(...chunk.map(p => ({ lat: p.lat, lng: p.lng })));
+      continue;
     }
+
+    // (2) #499 — /match failed (common when pings are far apart). Instead of a
+    //     straight-line sum, ask OSRM /route for the real ROAD distance between
+    //     these waypoints. This is what keeps petrol billing on actual road km
+    //     even when the trace looks like a straight line on the map.
+    const rt = await osrmRouteChunk(chunk);
+    if (rt) {
+      roadChunks++;
+      meters += rt.distanceM;                        // OSRM road distance along the driven route
+      path.push(...rt.coords);
+      continue;
+    }
+
+    // (3) Last resort ONLY if OSRM is completely unreachable for this chunk:
+    //     guarded haversine so the segment is never lost nor inflated. Flagged
+    //     via straightChunks so callers (petrol billing) know the number is not
+    //     road-accurate and can choose to retry later instead of billing it.
+    straightChunks++;
+    for (let j = 1; j < chunk.length; j++) {
+      const legM = haversineKm(chunk[j - 1], chunk[j]) * 1000;
+      if (legM >= MATCH_MIN_STEP_M && legM < MATCH_MAX_LEG_M) meters += legM;
+    }
+    path.push(...chunk.map(p => ({ lat: p.lat, lng: p.lng })));
   }
   return {
     path: path.length >= 2 ? path : clean.map(p => ({ lat: p.lat, lng: p.lng })),
     distanceKm: Math.round((meters / 1000) * 100) / 100,
-    source: anyMatched ? 'osrm' : 'gps',
+    // 'osrm'  = every measured chunk was road-accurate (match or route).
+    // 'gps'   = at least one chunk fell to straight-line (OSRM unreachable).
+    source: straightChunks === 0 && roadChunks > 0 ? 'osrm' : 'gps',
   };
 }
 
