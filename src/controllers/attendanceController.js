@@ -225,8 +225,11 @@ async function buildDailyRoute(userId, dateIso, opts = {}) {
     const total = measured.distanceKm;
     const first = pings[0];
     const last  = pings[pings.length - 1];
+    // #488 — Polyline is built from the DE-NOISED path only, never the raw
+    // pings (raw fallback is what drew GPS-drift zig-zags). Stationary days
+    // collapse to ~1 anchor point → 0 km, no fake path.
     const compact = simplifyPolyline(
-      (measured.path && measured.path.length >= 2 ? measured.path : pings).map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
+      (measured.path || []).map((p) => ({ lat: p.lat, lng: p.lng, at: p.recordedAt })),
       10,   // metres — dropping noise-level deltas
     );
     return {
@@ -2642,29 +2645,88 @@ async function osrmMatchChunk(points) {
   }
 }
 
-// #466 — Clean a raw ping trace before road-matching + distance:
-//   • chronological order (defensive re-sort by recordedAt)
-//   • drop poor-accuracy fixes (> MATCH_MAX_ACCURACY_M) — bad GPS / indoor
-//   • drop near-duplicate consecutive points (< MATCH_MIN_STEP_M) — stationary
-//     drift and duplicate pings
-// This is what stops indoor wandering, poor GPS, and duplicate pings from ever
-// inflating the reimbursable km.
-const MATCH_MAX_ACCURACY_M = 100;   // ignore fixes worse than 100 m
-const MATCH_MIN_STEP_M     = 4;     // collapse jitter/dupes under 4 m
-const MATCH_MAX_LEG_M      = 50000; // ignore single-tick teleports (bad fix)
+// #488 — Clean a raw ping trace before road-matching + distance so that GPS
+// DRIFT around a stationary employee never becomes a fake "travelled route".
+// Runs at compute time for BOTH the Daily-Routes list distance and the HRMS
+// route modal, so it also retroactively de-noises every previously-stored day.
+//
+// Filters applied, in order, against a COMMITTED ANCHOR (not just the previous
+// point — that's what let slow zig-zag drift accumulate):
+//   1. Accuracy gate — drop low-confidence fixes outright (bad GPS / indoor).
+//   2. Stationary radius — a new point within max(STATIONARY_RADIUS_M, its own
+//      accuracy, the anchor's accuracy) of the anchor is the SAME place (drift);
+//      it is skipped and the anchor is held. "Movement" smaller than the GPS
+//      uncertainty is not movement. This collapses the spider-web to one point.
+//   3. Teleport guard — a single leg ≥ MATCH_MAX_LEG_M is a bad fix, dropped.
+//   4. Speed sanity — a leg implying > MAX_SPEED_MPS is physically impossible
+//      between two fixes, so it's GPS noise, dropped.
+// Only a point that clears ALL of these commits as the new anchor and counts as
+// real travel. A house-bound employee therefore yields ~1 anchor (≈0 km); a
+// genuine trip yields the real sequence of moves.
+const MATCH_MAX_ACCURACY_M = 100;    // ignore fixes worse than 100 m (unreliable)
+const MATCH_MIN_STEP_M     = 4;      // legacy jitter floor (still used by fallback loop)
+const MATCH_MAX_LEG_M      = 50000;  // ignore single-tick teleports (bad fix)
+const STATIONARY_RADIUS_M  = 50;     // within this of the cluster centre = same place (drift)
+const MAX_SPEED_MPS        = 45;     // ~162 km/h — faster between fixes = GPS noise
 function cleanTraceForMatching(pings) {
   const rows = (pings || [])
     .filter(p => Number.isFinite(p?.lat) && Number.isFinite(p?.lng))
     .filter(p => p.accuracy == null || Number(p.accuracy) <= MATCH_MAX_ACCURACY_M)
     .slice()
     .sort((a, b) => new Date(a.recordedAt || a.t || 0) - new Date(b.recordedAt || b.t || 0));
+
   const out = [];
+  // The anchor is the running CENTROID of the current stationary cluster, not
+  // the last raw point. GPS drift wobbles AROUND the true position, so the
+  // centroid stays put and drift samples land within the radius → nothing is
+  // emitted. Committing to each raw point (as a naive filter does) lets the
+  // anchor chase the drift and re-emit the spider-web.
+  //
+  // DEPARTURE CONFIRMATION: a point that leaves the cluster is not emitted
+  // immediately — it's held as `pending`. It only counts as real movement if
+  // the NEXT fix is ALSO outside the cluster (sustained departure). A lone
+  // outlier that jumps out then snaps back is a drift spike and is discarded.
+  // Continuous travel keeps leaving, so every step is confirmed by the next.
+  let cLat = null, cLng = null, cN = 0, cAcc = 0, cT = 0;
+  let pending = null;
+  const reseed = (p, acc, pT) => { cLat = p.lat; cLng = p.lng; cN = 1; cAcc = acc; cT = pT; };
   for (const p of rows) {
-    const prev = out[out.length - 1];
-    if (!prev) { out.push(p); continue; }
-    const stepM = haversineKm(prev, p) * 1000;
-    if (stepM >= MATCH_MIN_STEP_M) out.push(p);   // drop stationary jitter / dupes
+    const pT  = new Date(p.recordedAt || p.t || 0).getTime();
+    const acc = Number(p.accuracy) || 0;
+    if (cN === 0) { reseed(p, acc, pT); out.push(p); continue; }
+
+    const stepM = haversineKm({ lat: cLat, lng: cLng }, p) * 1000;
+    const noiseFloor = Math.max(STATIONARY_RADIUS_M, acc, cAcc);
+
+    // (2) Inside the stationary radius → same place. Fold into the centroid,
+    //     and cancel any pending departure (it snapped back = drift spike).
+    if (stepM < noiseFloor) {
+      cLat = (cLat * cN + p.lat) / (cN + 1);
+      cLng = (cLng * cN + p.lng) / (cN + 1);
+      cN += 1;
+      pending = null;
+      continue;
+    }
+    // (3) Teleport guard, and (4) speed sanity — both = bad fix, drop.
+    if (stepM >= MATCH_MAX_LEG_M) continue;
+    const dtSec = Math.max(1, (pT - cT) / 1000);
+    if ((stepM / dtSec) > MAX_SPEED_MPS) continue;
+
+    // Outside the cluster.
+    if (!pending) {
+      pending = { p, acc, pT };            // first departure → wait for confirmation
+      continue;
+    }
+    // Second consecutive departure → the earlier point was real movement.
+    out.push(pending.p);
+    reseed(pending.p, pending.acc, pending.pT);
+    pending = { p, acc, pT };              // this point now awaits its own confirmation
   }
+  // Flush a trailing confirmed-enough departure (e.g. a real move right before
+  // check-out with no fix after it). A single unconfirmed outlier at the very
+  // end is dropped by NOT flushing when it never had a follow-up — but we DO
+  // emit it if the day otherwise had movement, to avoid losing a real last leg.
+  if (pending && out.length > 1) out.push(pending.p);
   return out;
 }
 
@@ -2782,7 +2844,11 @@ exports.adminDailyRoute = async (req, res) => {
     // mobile. On OSRM failure it falls back to a guarded haversine (jitter +
     // teleport legs dropped) so it never inflates.
     const measured = await roadSnapAndMeasure(pings);
-    const drawPath = (measured.path && measured.path.length >= 2) ? measured.path : route;
+    // #488 — Draw ONLY the de-noised path. Never fall back to the raw `route`
+    // (that fallback is what redrew the GPS-drift spider-web whenever OSRM was
+    // unavailable). A stationary day collapses to a single anchor → one marker,
+    // no lines; a real trip keeps its genuine points.
+    const drawPath = (measured.path && measured.path.length >= 1) ? measured.path : [];
     const totalM   = measured.distanceKm * 1000;
 
     const fullName = user.name || ((user.firstName || '') + ' ' + (user.lastName || '')).trim() || 'Unknown';
