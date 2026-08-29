@@ -1270,6 +1270,85 @@ exports.adminSummary = async (req, res) => {
   }
 };
 
+// #494 — GET /api/attendance/admin/summary-all?month=&year=   (x-admin-secret)
+//
+// HR-only BULK monthly summary for EVERY employee in ONE call. Returns the
+// IDENTICAL computeMonthlySummary object (same fully-approved leave/permission
+// overlay, HR-override precedence, holiday-as-present rule, and approved-
+// permission count) for each employee.
+//
+// The HRMS Attendance REPORT (Backend/routes/reportRoutes.js) consumes this to
+// build its per-employee rows from the EXACT counts the ERM app + Manager team
+// report already show — instead of re-deriving present/late/absent/permission
+// in HRMS with a different algorithm, which was the source of the mismatch.
+// One row per employee here → HRMS can guarantee no missing / duplicate rows.
+exports.adminSummaryAll = async (req, res) => {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const got      = (req.headers['x-admin-secret'] || '').trim();
+  if (!expected)        return res.status(503).json({ message: 'ADMIN_SECRET not configured.' });
+  if (got !== expected) return res.status(401).json({ message: 'Missing/invalid x-admin-secret.' });
+
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+    if (!month || !year) {
+      return res.status(400).json({ message: 'month and year required' });
+    }
+
+    // Every employee in the shared `employees` collection that carries a
+    // company employeeId. We compute for ALL of them (active + terminated);
+    // the caller decides which rows to display, so no employee is missed and
+    // none is duplicated. `.lean()` → virtuals don't run, so we also select
+    // the raw `name`/firstName/lastName and rebuild the display name below.
+    const users = await User.find(
+      { employeeId: { $exists: true, $nin: [null, ''] } },
+      { _id: 1, employeeId: 1, firstName: 1, lastName: 1, name: 1 }
+    ).lean();
+
+    // Bounded concurrency: ~45 employees × ~3 queries each shouldn't stampede
+    // the connection pool. A pool of 8 keeps latency low without overloading.
+    const items = [];
+    const POOL  = 8;
+    let idx = 0;
+    const worker = async () => {
+      while (idx < users.length) {
+        const u = users[idx++];
+        const identity = {
+          userId:     String(u._id),
+          employeeId: u.employeeId || '',
+          name: u.name || [u.firstName, u.lastName].filter(Boolean).join(' ').trim(),
+        };
+        try {
+          const s = await computeMonthlySummary(u._id, month, year);
+          items.push({
+            ...identity,
+            present:         s.present         || 0,
+            late:            s.late            || 0,
+            absent:          s.absent          || 0,
+            permission:      s.permission      || 0,
+            halfday:         s.halfday          || 0,
+            leave:           s.leave           || 0,
+            holiday:         s.holiday         || 0,
+            workdaysElapsed: s.workdaysElapsed || 0,
+          });
+        } catch (e) {
+          console.warn('[adminSummaryAll] failed for', String(u._id), e.message);
+          items.push({ ...identity, present: 0, late: 0, absent: 0, permission: 0,
+                       halfday: 0, leave: 0, holiday: 0, workdaysElapsed: 0 });
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(POOL, users.length || 1) }, worker)
+    );
+
+    res.json({ success: true, month, year, count: items.length, items });
+  } catch (err) {
+    console.error('[adminSummaryAll]', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
 // GET /api/attendance/history?month=&year=
 // Daily history list for the month
 //

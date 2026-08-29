@@ -9,6 +9,7 @@ const {
   getCalendar,
   getSummary,
   adminSummary,
+  adminSummaryAll,
   getHistory,
   createRequest,
   listRequests,
@@ -71,6 +72,11 @@ router.patch('/admin/mark-status',       adminMarkStatus);
 // panel matches the ERM attendance cards exactly instead of recomputing.
 // Query: ?employeeId=TES080&month=7&year=2026  (or ?userId=<objectId>)
 router.get  ('/admin/summary',           adminSummary);
+// #494 — BULK version: one call → canonical monthly summary for EVERY
+// employee. The HRMS Attendance Report builds its rows from this so its
+// present/late/absent/permission counts are identical to the ERM app +
+// Manager team report. Query: ?month=8&year=2026
+router.get  ('/admin/summary-all',       adminSummaryAll);
 router.get  ('/admin/live-locations',  adminLiveLocations);
 // #370 — Per-employee ping analytics for a date. Returns count, first/last
 // ping, elapsed vs pinged minutes, coverage %, largest gap. Header:

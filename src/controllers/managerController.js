@@ -51,8 +51,11 @@ function managerDisplayNames(user) {
   if (full)            names.add(full);
   if (first)           names.add(first);
   if (user.name)       names.add(String(user.name).trim());
-  if (user.employeeId) names.add(String(user.employeeId).trim());
-  if (user.userId)     names.add(String(user.userId).trim());
+  // #490 — DO NOT match assignedTo against the manager's employeeId / userId.
+  // `assignedTo` always holds a manager NAME (that's what the HRMS dropdown
+  // stores). Matching it against an ID could wrongly claim an employee whose
+  // assignedTo coincidentally equals a manager's id, and keeps stale team
+  // membership after a reassignment. Name-only matching is the source of truth.
   return [...names].filter(Boolean);
 }
 
