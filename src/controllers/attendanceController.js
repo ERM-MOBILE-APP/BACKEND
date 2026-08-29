@@ -2545,8 +2545,28 @@ exports.adminDailyRoutesList = async (req, res) => {
         ((u.firstName || '') + ' ' + (u.lastName || '')).trim() ||
         '—';
       const allow = allowByUser.get(String(u._id || a.user));
-      const ciLat = (typeof a.checkInLat === 'number') ? a.checkInLat : null;
-      const ciLng = (typeof a.checkInLng === 'number') ? a.checkInLng : null;
+      let ciLat = (typeof a.checkInLat === 'number') ? a.checkInLat : null;
+      let ciLng = (typeof a.checkInLng === 'number') ? a.checkInLng : null;
+      let checkInApprox = false;
+      // #487 — MATCH LIVE TRACKING. If the check-in tap captured no GPS
+      // (location off / no fix at the tap), fall back to the employee's
+      // EARLIEST ping of the day as the check-in-location proxy — exactly
+      // what adminLiveLocations does. Without this the "Checked-in Location"
+      // column showed "—" for a GPS-off check-in even though Live Tracking
+      // resolved a real place from the first ping (the reported mismatch).
+      if (ciLat == null || ciLng == null) {
+        try {
+          const firstPing = await LocationPing.findOne({ user: u._id || a.user, date })
+            .sort({ recordedAt: 1 })
+            .select('lat lng')
+            .lean();
+          if (firstPing && typeof firstPing.lat === 'number' && typeof firstPing.lng === 'number') {
+            ciLat = firstPing.lat;
+            ciLng = firstPing.lng;
+            checkInApprox = true; // derived from first ping, not the check-in tap
+          }
+        } catch { /* no pings for this user/day */ }
+      }
       const checkInIsOffice =
         (ciLat != null && ciLng != null)
           ? distM(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
@@ -2568,6 +2588,7 @@ exports.adminDailyRoutesList = async (req, res) => {
         checkInLat:  ciLat,
         checkInLng:  ciLng,
         checkInIsOffice,
+        checkInApprox,
         hasAllowance: !!allow,
         allowanceStatus: allow ? allow.status : '',
       };

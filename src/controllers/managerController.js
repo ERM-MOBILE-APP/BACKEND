@@ -106,7 +106,7 @@ async function resolveTeamIds(req) {
   const uniqNames = [...new Set(names.filter((s) => s && String(s).trim()))];
   const team = await User
     .find(assignedToFilter(uniqNames))
-    .select('_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt')
+    .select('_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt status isActive')
     .lean();
   return { manager: me, team, names: uniqNames };
 }
@@ -215,6 +215,11 @@ exports.team = async (req, res) => {
         presence:    u.presence    || 'offline',
         lastLocation:u.lastLocation || null,
         lastSeenAt:  u.lastSeenAt   || null,
+        // #486 — employment status, so Manager Access can show a terminated /
+        // resigned member as "Inactive" and stop treating them as active.
+        status:      u.status || 'Active',
+        active:      (u.isActive !== false) &&
+                     !['Terminated', 'Inactive', 'Resigned'].includes(String(u.status || 'Active')),
       })),
     });
   } catch (err) {
