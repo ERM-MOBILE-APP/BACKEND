@@ -88,11 +88,17 @@ const attendanceSchema = new mongoose.Schema(
     // HRMS pulls from here so even employees who didn't submit an
     // allowance request have their km accounted for.
     // distanceSource:
-    //   'gps'    — derived from LocationPings (≥ 2 pings on the day)
-    //   'pins'   — only checkIn/checkOut coords available, straight-line
-    //   'none'   — no usable coords on the day
+    //   'osrm-road' — OSRM road-matched / road-routed distance (#499, canonical)
+    //   'gps'       — derived from LocationPings (≥ 2 pings on the day)
+    //   'pins'      — only checkIn/checkOut coords available, straight-line
+    //   'attendance'— taken from the persisted totalDistanceKm
+    //   'none'      — no usable coords on the day
+    // #499 — 'osrm-road' MUST be here: buildDailyRoute now returns it whenever
+    // the road matcher/router succeeds, and checkOut writes dayRoute.source
+    // straight into this field. Without it, Mongoose enum validation rejected
+    // the save and check-out 500'd ("Server error").
     totalDistanceKm: { type: Number, default: 0 },
-    distanceSource:  { type: String, enum: ['gps', 'pins', 'none'], default: 'none' },
+    distanceSource:  { type: String, enum: ['osrm-road', 'gps', 'pins', 'attendance', 'none'], default: 'none' },
 
     // ── HR LOP markers ───────────────────────────────────────────────
     // True when the employee hit Check-Out before the scheduled end of

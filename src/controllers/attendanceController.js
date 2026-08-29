@@ -748,7 +748,7 @@ exports.checkOut = async (req, res) => {
               date,
               transport:      'Bike',
               distance:       km,
-              distanceSource: source === 'gps' || source === 'pins' ? 'gps' : 'manual',
+              distanceSource: source === 'gps' || source === 'pins' || source === 'osrm-road' ? 'gps' : 'manual',
               fromLat,
               fromLng,
               toLat,
