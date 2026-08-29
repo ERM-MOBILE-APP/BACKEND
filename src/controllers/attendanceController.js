@@ -2372,18 +2372,31 @@ exports.adminLiveLocations = async (req, res) => {
 
       // Travel trail for the polyline on HRMS Live Tracking — only
       // attached for travelling employees (others don't have a useful trail).
+      // #489 — ROAD-MATCH the live trail, identical to Daily Routes. It used to
+      // draw raw pings joined by straight lines, which cut diagonally across
+      // buildings and drew GPS-drift zig-zags. Now the SAME pipeline runs:
+      //   cleanTraceForMatching  → drop low-accuracy / stationary-drift /
+      //                            teleport / impossible-speed points
+      //   roadSnapAndMeasure     → snap the validated sequence onto the road
+      //                            network via OSRM (the whole trace at once,
+      //                            so it follows connected roads, not per-point
+      //                            nearest-road jumps)
+      // If OSRM is unreachable it falls back to the DE-NOISED straight segments
+      // (never the raw noisy points), so the trail is always clean.
       let route = null;
       if (status === "travelling") {
         try {
           const pings = await LocationPing.find({ user: u._id, date: todayIso })
             .sort({ recordedAt: 1 })
-            .limit(50)
-            .select("lat lng recordedAt")
+            .select("lat lng recordedAt accuracy")
             .lean();
           if (pings.length >= 2) {
-            route = pings.map((p) => ({ lat: p.lat, lng: p.lng, t: p.recordedAt }));
+            const snapped = await roadSnapAndMeasure(pings);
+            if (snapped.path && snapped.path.length >= 2) {
+              route = snapped.path.map((p) => ({ lat: p.lat, lng: p.lng }));
+            }
           }
-        } catch { /* non-fatal */ }
+        } catch { /* non-fatal — omit the trail rather than draw noise */ }
       }
 
       const fullName = u.name || ((u.firstName || "") + " " + (u.lastName || "")).trim() || "Unknown";
