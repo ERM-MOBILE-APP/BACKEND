@@ -80,6 +80,13 @@ async function sendFcmToUser(userId, { title, body, data } = {}) {
       dataStr[k] = v == null ? '' : String(v);
     });
 
+    // Duplicate prevention: key both the collapseKey (dedupes messages still
+    // queued at FCM) and the Android notification `tag` (a new push with the
+    // same tag REPLACES the old one instead of stacking) on the unique
+    // Notification id. So a retry of the SAME event never shows twice, while
+    // different events keep their own separate notifications.
+    const dedupeKey = dataStr.notificationId || undefined;
+
     const message = {
       tokens,
       notification: {
@@ -89,9 +96,11 @@ async function sendFcmToUser(userId, { title, body, data } = {}) {
       data: dataStr,
       android: {
         priority: 'high',
+        collapseKey: dedupeKey,
         notification: {
           channelId: 'default',
           sound: 'default',
+          tag: dedupeKey,
           // Ensures a tap delivers the data payload to the app for deep-linking.
           clickAction: 'FLUTTER_NOTIFICATION_CLICK',
         },

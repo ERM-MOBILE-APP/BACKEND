@@ -69,21 +69,19 @@ exports.list = async (req, res) => {
     // array) and inject it on the response. Strip the (potentially
     // large) readBy array before sending so the wire payload stays slim.
     const meId = req.user && req.user.id ? String(req.user.id) : '';
-    // ── Home feed = HR / company announcements ONLY ───────────────────
-    // Manager-posted team announcements (audience:'team') must NOT appear
-    // in the employee Home announcements feed — they belong only in the
-    // Manager > Announcements screen (GET /api/manager/announcements), and
-    // team members are informed via a push notification when one is posted.
-    // So the Home feed here shows only 'all' / 'department' (HR/company)
-    // announcements. This also fixes the "Posted by HR" mislabel that
-    // appeared when a manager post surfaced on Home.
-    // Exclude BOTH team-scoped audience values from the general feed:
-    // 'team' (posted from ERM mobile) and 'manager-team' (posted from ERM
-    // web). Manager announcements belong only in the Manager Announcements
-    // screen; team members are informed via the bell/push, not this feed.
+    // ── Feed = HR/company announcements + the viewer's OWN team posts ──
+    // #518 — A manager-posted team announcement now appears in the feed of the
+    // people it was sent to (its audienceUserIds), attributed to the actual
+    // manager / senior manager (the client shows "Posted by <postedBy>"). It is
+    // still hidden from everyone OUTSIDE that team. HR/company announcements
+    // ('all' / 'department') stay visible to all. This replaces the earlier
+    // blanket exclusion (which existed only to dodge a since-fixed
+    // "Posted by HR" mislabel).
     const visible = items.filter((r) => {
       const aud = String(r.audience || 'all');
-      return aud !== 'team' && aud !== 'manager-team';
+      if (aud !== 'team' && aud !== 'manager-team') return true; // HR/company → everyone
+      const ids = Array.isArray(r.audienceUserIds) ? r.audienceUserIds.map(String) : [];
+      return !!meId && ids.includes(meId);                       // team post → only its audience
     });
     const shaped = visible.map((r) => {
       const readBy = Array.isArray(r.readBy) ? r.readBy.map(String) : [];

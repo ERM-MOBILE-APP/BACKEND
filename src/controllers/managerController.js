@@ -1052,6 +1052,7 @@ exports.postAnnouncement = async (req, res) => {
           title: `New announcement from ${postedByName}`,
           body:  title,
           type:  'announcement',
+          link:  '/announcement', // deep-link the push tap to the announcements feed
         })
       ));
     } catch (e) {
