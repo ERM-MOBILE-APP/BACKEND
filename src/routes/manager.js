@@ -13,6 +13,10 @@ const auth    = require('../middleware/authMiddleware');
 const mgr     = require('../controllers/managerController');
 
 router.get('/me',                 auth, mgr.me);
+// One tier of the reporting tree (direct reports split into sub-managers vs
+// leaf members). ?managerId= drills into a sub-manager's tier. Drives the
+// expandable Manager-section hierarchy.
+router.get('/hierarchy',          auth, mgr.hierarchy);
 router.get('/team',               auth, mgr.team);
 
 router.get('/leaves',             auth, mgr.leaves);
