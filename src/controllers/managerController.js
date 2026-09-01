@@ -100,7 +100,7 @@ function isActiveMember(u) {
 // memoise a person's downline / direct reports for a few seconds, so the burst
 // of calls shares one computed result. Staleness is bounded and harmless — a
 // reporting change simply takes up to TTL to appear.
-const DOWNLINE_TTL_MS = 15000;
+const DOWNLINE_TTL_MS = 30000;
 const _downlineCache = new Map(); // idStr → { at, team, names }
 const _directCache   = new Map(); // idStr → { at, reports }
 
@@ -414,10 +414,14 @@ exports.hierarchy = async (req, res) => {
     if (!node) return res.status(404).json({ success: false, message: 'Manager not found.' });
 
     const directs  = await directReportsOf(node);
-    const managers = [];
-    const leaves   = [];
 
-    for (const r of directs) {
+    // #515 perf — resolve every direct report CONCURRENTLY. Each needs a
+    // "is this person a manager?" check (a cheap cached direct-reports lookup)
+    // and, only for actual managers, a full-downline count. Running them in
+    // parallel (instead of awaiting one-by-one) collapses ~N sequential DB
+    // round-trips into a few concurrent batches — the main reason the section
+    // was slow to load.
+    const resolved = await Promise.all(directs.map(async (r) => {
       const base = {
         _id:         r._id,
         employeeId:  r.employeeId,
@@ -431,18 +435,14 @@ exports.hierarchy = async (req, res) => {
         active:      (r.isActive !== false) &&
                      !['Terminated', 'Inactive', 'Resigned'].includes(String(r.status || 'Active')),
       };
-      // A direct report is itself a MANAGER if anyone reports to them. Detect
-      // that with a cheap DIRECT-reports lookup first (cached, one query) and
-      // only pay the full-downline BFS for people who are actually managers —
-      // leaf employees (the majority) skip it entirely. (#513 perf)
       const subDirects = await directReportsOf(r);
-      if (subDirects.length > 0) {
-        const sub = await resolveDownline(r);
-        managers.push({ ...base, teamCount: sub.team.length });
-      } else {
-        leaves.push(base);
-      }
-    }
+      if (subDirects.length === 0) return { isManager: false, node: base };
+      const sub = await resolveDownline(r);
+      return { isManager: true, node: { ...base, teamCount: sub.team.length } };
+    }));
+
+    const managers = resolved.filter((x) => x.isManager).map((x) => x.node);
+    const leaves   = resolved.filter((x) => !x.isManager).map((x) => x.node);
 
     res.json({
       success: true,
