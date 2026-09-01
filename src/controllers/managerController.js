@@ -182,9 +182,24 @@ async function resolveTeamIds(req) {
     frontier = [...new Set(next)];
   }
 
+  const finalTeam = [...teamById.values()];
+  // #510 — TEMP diagnostic (safe to remove later): shows in Render logs exactly
+  // who the hierarchy resolver matched, so a broken assignedTo name-chain is
+  // visible without DB access.
+  try {
+    const meName = (me.name || `${me.firstName || ''} ${me.lastName || ''}`).trim();
+    console.log('[resolveTeamIds]',
+      'me=', meName,
+      '| seedNames=', JSON.stringify([...new Set(seedNames.filter(Boolean))]),
+      '| depth=', depth,
+      '| teamCount=', finalTeam.length,
+      '| team=', JSON.stringify(finalTeam.map((u) => (u.employeeId || u.name || String(u._id))))
+    );
+  } catch { /* logging must never break the request */ }
+
   return {
     manager: me,
-    team: [...teamById.values()],
+    team: finalTeam,
     names: [...new Set(namesAll.filter((s) => s && String(s).trim()))],
   };
 }
