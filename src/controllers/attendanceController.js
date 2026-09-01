@@ -342,10 +342,10 @@ exports.checkIn = async (req, res) => {
     }).formatToParts(now);
     const istHour   = parseInt(istParts.find(p => p.type === 'hour')?.value   || '0', 10);
     const istMinute = parseInt(istParts.find(p => p.type === 'minute')?.value || '0', 10);
-    // #352a — Three-tier check-in classification per HR policy (Jul 2026):
+    // #520 — Three-tier check-in classification per HR policy (Sep 2026):
     //   ≤ 10:00                    → present  (on-time)
-    //   10:01 AM – 10:30 AM        → late     (still counted present, HR sees Late flag)
-    //   > 10:30 AM                 → absent   (marked absent even though they DID
+    //   10:01 AM – 10:10 AM        → late     (still counted present, HR sees Late flag)
+    //   ≥ 10:11 AM                 → absent   (marked absent even though they DID
     //                                          check in; employee can file an
     //                                          Attendance Regularisation request
     //                                          which, once the manager approves it,
@@ -354,14 +354,11 @@ exports.checkIn = async (req, res) => {
     //                                          manually mark 'present' via the
     //                                          adminMarkStatus endpoint.)
     //
-    // Rationale: the old rule marked ANY check-in after 10:01 as Late
-    // regardless of how late they were — a 4-hour delay looked the same
-    // as a 2-minute one. The new rule gives HR + payroll a clean signal
-    // that the late tier ends at 10:30 and anything beyond is treated as
-    // an unexplained absence until the employee justifies it.
+    // The late tier now ends at 10:10 (was 10:30); anything from 10:11 onward
+    // is an unexplained absence until the employee justifies it.
     const minutesSinceMidnight = istHour * 60 + istMinute;
     const LATE_START = 10 * 60 + 1;    // 10:01
-    const LATE_END   = 10 * 60 + 30;   // 10:30
+    const LATE_END   = 10 * 60 + 10;   // 10:10
     let checkInStatus;
     if (minutesSinceMidnight < LATE_START) {
       checkInStatus = 'present';
@@ -2176,12 +2173,12 @@ exports.adminListAll = async (req, res) => {
       if (s !== 'present' && s !== 'late' && s !== 'absent') continue;
       const { h, m } = istHm(a.checkIn);
       const mins = h * 60 + m;
-      if (mins < 10 * 60 + 1) {
+      if (mins < 10 * 60 + 1) {          // < 10:01
         a.status = 'present';
-      } else if (mins <= 10 * 60 + 30) {
+      } else if (mins <= 10 * 60 + 10) { // 10:01–10:10
         a.status = 'late';
       } else {
-        // > 10:30 AM check-in — reclassify to Absent (unless the row was
+        // ≥ 10:11 AM check-in — reclassify to Absent (unless the row was
         // already flipped to Permission by a manager-approved
         // regularisation, which we skipped above).
         a.status = 'absent';

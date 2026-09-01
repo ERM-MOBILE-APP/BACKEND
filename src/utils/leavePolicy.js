@@ -41,11 +41,12 @@ const HOURS_PER_LOP_DAY          = 8; // 8 hours of excess permission time = 1 L
 // Anyone with fewer than 3 late check-ins in the month gets no LOP from lateness.
 const LATES_PER_HALF_DAY_LOP     = 3;
 
-// Beyond ordinary lateness (10:01-10:30) HR set a harder rule: a check-in
-// past 10:30 is immediately 0.5 LOP for that day, regardless of how many
-// other lates the employee has accumulated.
+// #520 — Late window is now 10:01–10:10 IST; anything from 10:11 onward is
+// beyond ordinary lateness. Such a check-in is immediately 0.5 LOP for that
+// day, regardless of how many other lates the employee has accumulated.
+// (Old cutoff was 10:30 — no longer used anywhere.)
 const HARD_LATE_HOUR_IST   = 10;
-const HARD_LATE_MINUTE_IST = 30;
+const HARD_LATE_MINUTE_IST = 10;
 
 // Per-day attendance-derived LOP rules — folded into the totals below.
 // Each early-checkout without an approved permission counts as 0.5 LOP.
