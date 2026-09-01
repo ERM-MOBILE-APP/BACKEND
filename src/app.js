@@ -157,6 +157,12 @@ app.get('/api/_health', function (req, res) { res.json({ ok: true, ts: new Date(
 
 app.listen(PORT, function () {
   console.log('Server running on port ' + PORT);
+  // #522 — Eagerly initialise Firebase Admin at boot so its status is logged
+  // on EVERY startup (the lazy first-send log was easy to miss). One clear line
+  // now appears at boot: "[fcm] ✓ Firebase Admin initialised" (good),
+  // "[fcm] No Firebase service account configured" (env missing), or
+  // "[fcm] firebase-admin unavailable: …" (base64/JSON malformed).
+  try { require('./utils/fcm').getAdmin(); } catch (e) { console.warn('[fcm] boot init failed:', e.message); }
   // Kick off the keep-alive cron once the server is up
   startKeepAlive(PORT);
     // Sweep open check-ins at IST midnight - mark as absent.

@@ -67,12 +67,23 @@ function getAdmin() {
 async function sendFcmToUser(userId, { title, body, data } = {}) {
   try {
     const admin = getAdmin();
-    if (!admin) return;
+    if (!admin) {
+      // #522 diagnostic — make the "why nothing sent" reason visible instead of
+      // returning silently. This fires when Firebase Admin didn't initialise
+      // (missing / malformed FIREBASE_SERVICE_ACCOUNT_BASE64).
+      console.warn(`[fcm] skip user=${userId}: Firebase Admin not initialised (check FIREBASE_SERVICE_ACCOUNT_BASE64)`);
+      return;
+    }
 
     const DeviceToken = require('../models/DeviceToken');
     const rows = await DeviceToken.find({ user: userId }).select('token').lean();
     const tokens = rows.map((r) => r.token).filter(Boolean);
-    if (tokens.length === 0) return;
+    if (tokens.length === 0) {
+      // #522 diagnostic — no device has registered a push token for this user
+      // (app not on the new Firebase build, or notification permission denied).
+      console.log(`[fcm] skip user=${userId}: no registered device tokens`);
+      return;
+    }
 
     // FCM data payload must be all-string.
     const dataStr = {};
