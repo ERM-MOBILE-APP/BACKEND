@@ -78,40 +78,115 @@ function assignedToFilter(names) {
   return { $or: orClauses };
 }
 
-/** Resolve the list of subordinate ObjectIds for the logged-in manager. */
+// Fields every subordinate row needs across the manager endpoints.
+const TEAM_SELECT = '_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt status isActive';
+
+/**
+ * Resolve the FULL downline for the logged-in manager — #510 senior-manager
+ * hierarchy. Not just direct reports: we walk the reporting tree DOWNWARD.
+ *
+ *   Senior Manager → Manager → Employees
+ *
+ * `assignedTo` on each employee holds their DIRECT manager's NAME, so the tree
+ * is implicit. We BFS it: match the manager's names → direct reports; for each
+ * report who is themselves a manager (their name appears as someone's
+ * assignedTo) queue their name → next level; repeat. So a Senior Manager sees
+ * the Manager AND the Manager's team, automatically, with no manual add.
+ *
+ * Guards: a visited-name set (never query the same name twice) + a visited-id
+ * set (never collect the same person twice, and never include self) break any
+ * accidental reporting cycle; a depth cap is a final safety net.
+ *
+ * Because it's derived live from `assignedTo`, reassigning an employee in HRMS
+ * instantly changes who each manager (and every manager above) can see.
+ */
 async function resolveTeamIds(req) {
   const me = await User.findById(req.user.id).lean();
   if (!me) return { manager: null, team: [], names: [] };
-  const names = managerDisplayNames(me);
 
-  // Pull this user's canonical name from the shared `managers` directory.
-  // HR adds entries there using whatever name they want shown in the
-  // Assigned-To dropdown — that's the value that ends up in employees'
-  // assignedTo field. Match by EITHER email OR existing names so we catch
-  // both Convert-to-Manager and Add-Manager flows.
+  // Seed names = the manager's own display names + any aliases the shared
+  // `managers` directory records (HR may add an entry under a chosen name;
+  // that's the value that lands in employees' assignedTo).
+  const seedNames = managerDisplayNames(me);
   try {
     const mgrCol = mongoose.connection.db.collection('managers');
     const orClauses = [];
     if (me.email) orClauses.push({ email: String(me.email).toLowerCase() });
-    for (const n of names) {
+    for (const n of seedNames) {
       orClauses.push({ name: new RegExp(`^\\s*${String(n).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i') });
     }
     if (orClauses.length > 0) {
       const hits = await mgrCol.find({ isActive: true, $or: orClauses }).toArray();
       for (const h of hits) {
-        if (h && h.name) names.push(String(h.name).trim());
+        if (h && h.name) seedNames.push(String(h.name).trim());
       }
     }
   } catch (e) {
     console.warn('[manager.resolveTeamIds] directory lookup failed:', e.message);
   }
 
-  const uniqNames = [...new Set(names.filter((s) => s && String(s).trim()))];
-  const team = await User
-    .find(assignedToFilter(uniqNames))
-    .select('_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt status isActive')
-    .lean();
-  return { manager: me, team, names: uniqNames };
+  const teamById  = new Map();   // _id string → user (unique downline members)
+  const seenNames = new Set();   // lowercased names already queried
+  const meIdStr   = String(me._id);
+  const namesAll  = [];          // every name used to match (returned to callers)
+  let   frontier  = [...new Set(seedNames.filter((s) => s && String(s).trim()))];
+  namesAll.push(...frontier);
+  let   depth     = 0;
+
+  while (frontier.length && depth < 12) {
+    depth++;
+    const toQuery = frontier.filter((n) => {
+      const k = String(n).toLowerCase();
+      if (seenNames.has(k)) return false;
+      seenNames.add(k);
+      return true;
+    });
+    if (!toQuery.length) break;
+
+    const level = await User.find(assignedToFilter(toQuery)).select(TEAM_SELECT).lean();
+    const newMembers = [];
+    for (const u of level) {
+      const idStr = String(u._id);
+      if (idStr === meIdStr) continue;      // never include self
+      if (teamById.has(idStr)) continue;    // already collected
+      teamById.set(idStr, u);
+      newMembers.push(u);
+    }
+
+    const next = [];
+    const pushName = (nm) => {
+      if (nm && !seenNames.has(String(nm).toLowerCase())) { next.push(nm); namesAll.push(nm); }
+    };
+    // A member might be a sub-manager → reach THEIR reports next. Match on names
+    // from BOTH the User row AND the shared `managers` directory. The directory
+    // name is what HR stores in the reports' `assignedTo`, and it can differ
+    // from the User-row name (initials, spacing) — that mismatch was breaking
+    // the chain below the first level, so a Senior Manager missed the sub-
+    // manager's team.
+    for (const u of newMembers) managerDisplayNames(u).forEach(pushName);
+    try {
+      const mgrCol = mongoose.connection.db.collection('managers');
+      const or = [];
+      for (const u of newMembers) {
+        if (u.email) or.push({ email: String(u.email).toLowerCase() });
+        for (const nm of managerDisplayNames(u)) {
+          or.push({ name: new RegExp(`^\\s*${String(nm).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i') });
+        }
+      }
+      if (or.length) {
+        const hits = await mgrCol.find({ isActive: true, $or: or }).toArray();
+        for (const h of hits) if (h && h.name) pushName(String(h.name).trim());
+      }
+    } catch { /* non-fatal — User-row names still drive the match */ }
+
+    frontier = [...new Set(next)];
+  }
+
+  return {
+    manager: me,
+    team: [...teamById.values()],
+    names: [...new Set(namesAll.filter((s) => s && String(s).trim()))],
+  };
 }
 
 // ─── helpers ────────────────────────────────────────────────────────

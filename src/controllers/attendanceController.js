@@ -3045,6 +3045,52 @@ exports.adminDailyRoute = async (req, res) => {
     const anchorPings = await LocationPing.countDocuments({ user: user._id, date, isAnchor: true });
     const movingPings = Math.max(0, totalPings - anchorPings);
 
+    // #507 — CHECKED-IN PLACE (identical logic to adminDailyRoutesList, so the
+    // Travel Report shows the SAME check-in place as the Daily Routes report):
+    //   ciLat/ciLng = check-in tap coords, else the earliest ping of the day.
+    //   checkInIsOffice = within the office geofence (SystemConfig anchor wins).
+    // Also surface from/to (route start → end) for the Travel Report's
+    // "Travel Details" column.
+    let OFFICE_LAT = parseFloat(process.env.OFFICE_LAT || '13.0412');
+    let OFFICE_LNG = parseFloat(process.env.OFFICE_LNG || '80.2127');
+    let OFFICE_RADIUS_M = parseFloat(process.env.OFFICE_RADIUS_M || '60');
+    try {
+      const SystemConfig = require('../models/SystemConfig');
+      const cfg = SystemConfig ? await SystemConfig.findOne({}).lean() : null;
+      const anchor = cfg && cfg.officeAnchor;
+      if (anchor && typeof anchor.lat === 'number' && typeof anchor.lng === 'number') {
+        OFFICE_LAT = anchor.lat; OFFICE_LNG = anchor.lng;
+        if (typeof anchor.radiusM === 'number') OFFICE_RADIUS_M = anchor.radiusM;
+      }
+    } catch { /* env/code defaults */ }
+    const distM = (la1, lo1, la2, lo2) => {
+      const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+      const dLa = toRad(la2 - la1), dLo = toRad(lo2 - lo1);
+      const x = Math.sin(dLa / 2) ** 2 +
+        Math.cos(toRad(la1)) * Math.cos(toRad(la2)) * Math.sin(dLo / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(x));
+    };
+    let ciLat = (typeof attendance?.checkInLat === 'number') ? attendance.checkInLat : null;
+    let ciLng = (typeof attendance?.checkInLng === 'number') ? attendance.checkInLng : null;
+    let checkInApprox = false;
+    if (ciLat == null || ciLng == null) {
+      try {
+        const firstPing = await LocationPing.findOne({ user: user._id, date })
+          .sort({ recordedAt: 1 }).select('lat lng').lean();
+        if (firstPing && typeof firstPing.lat === 'number' && typeof firstPing.lng === 'number') {
+          ciLat = firstPing.lat; ciLng = firstPing.lng; checkInApprox = true;
+        }
+      } catch { /* no pings */ }
+    }
+    const checkInIsOffice =
+      (ciLat != null && ciLng != null)
+        ? distM(ciLat, ciLng, OFFICE_LAT, OFFICE_LNG) <= OFFICE_RADIUS_M
+        : false;
+    const fromPt = drawPath.length ? { lat: drawPath[0].lat, lng: drawPath[0].lng }
+                 : (route.length ? { lat: route[0].lat, lng: route[0].lng } : null);
+    const toPt   = drawPath.length ? { lat: drawPath[drawPath.length - 1].lat, lng: drawPath[drawPath.length - 1].lng }
+                 : (route.length ? { lat: route[route.length - 1].lat, lng: route[route.length - 1].lng } : null);
+
     return res.json({
       success: true,
       employee: {
@@ -3077,6 +3123,13 @@ exports.adminDailyRoute = async (req, res) => {
                      : (route.length >= 2 ? 'gps' : (totalPings > 0 ? 'gps' : 'no-pings')),
       totalKm:         Number((totalM / 1000).toFixed(2)),
       totalDistanceKm: Number((totalM / 1000).toFixed(2)),
+      // #507 — check-in place source + route endpoints for the Travel Report.
+      checkInLat:      ciLat,
+      checkInLng:      ciLng,
+      checkInIsOffice,
+      checkInApprox,
+      from:            fromPt,
+      to:              toPt,
     });
   } catch (err) {
     console.error('adminDailyRoute error:', err);
