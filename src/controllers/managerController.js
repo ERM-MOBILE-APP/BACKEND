@@ -234,7 +234,17 @@ async function resolveScopedTeam(req) {
   if (!me) return { manager: null, target: null, team: [], names: [], denied: false };
 
   const managerId = String(req.query.managerId || req.query.viewAs || '').trim();
+  // `scope=direct` → only the target's DIRECT reports (level 1), not the full
+  // recursive downline. Used for a senior manager's OWN section (their direct
+  // team, excluding sub-managers' sub-teams) and the "direct reports only"
+  // announcement audience.
+  const directOnly = String(req.query.scope || '').trim().toLowerCase() === 'direct';
+
   if (!managerId || managerId === String(me._id)) {
+    if (directOnly) {
+      const team = await directReportsOf(me);
+      return { manager: me, target: me, team, names: [], denied: false };
+    }
     const { team, names } = await resolveDownline(me);
     return { manager: me, target: me, team, names, denied: false };
   }
@@ -249,6 +259,10 @@ async function resolveScopedTeam(req) {
   const targetDoc = await User.findById(managerId).lean();
   if (!targetDoc) return { manager: me, target: null, team: [], names: [], denied: true };
 
+  if (directOnly) {
+    const team = await directReportsOf(targetDoc);
+    return { manager: me, target: targetDoc, team, names: [], denied: false };
+  }
   const { team, names } = await resolveDownline(targetDoc);
   return { manager: me, target: targetDoc, team, names, denied: false };
 }
