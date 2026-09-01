@@ -82,6 +82,29 @@ function assignedToFilter(names) {
 const TEAM_SELECT = '_id firstName lastName name email phone employeeId designation department designationTitle departmentName photoUrl presence lastLocation lastSeenAt status isActive';
 
 /**
+ * Whether a team member is currently EMPLOYED (not terminated/resigned/
+ * inactive). Terminated staff still resolve into the team (so Team Members can
+ * badge them "Inactive"), but they're excluded from Attendance Reports and Live
+ * Tracking — they have no ongoing attendance or location to show.
+ */
+function isActiveMember(u) {
+  const s = String((u && u.status) || 'Active').trim();
+  return (u && u.isActive !== false) && !['Terminated', 'Inactive', 'Resigned'].includes(s);
+}
+
+// ── Short-TTL request-spanning caches (#513 perf) ──────────────────────────
+// The Manager hub fires several endpoints back-to-back (team, hierarchy, four
+// pending queues), and EACH used to re-walk the whole `assignedTo` tree from
+// scratch (many DB round-trips + a managers-directory lookup per level). That
+// repeated BFS is why the section sometimes took seconds to load. These caches
+// memoise a person's downline / direct reports for a few seconds, so the burst
+// of calls shares one computed result. Staleness is bounded and harmless — a
+// reporting change simply takes up to TTL to appear.
+const DOWNLINE_TTL_MS = 15000;
+const _downlineCache = new Map(); // idStr → { at, team, names }
+const _directCache   = new Map(); // idStr → { at, reports }
+
+/**
  * Resolve the FULL downline for the logged-in manager — #510 senior-manager
  * hierarchy. Not just direct reports: we walk the reporting tree DOWNWARD.
  *
@@ -133,10 +156,16 @@ async function seedNamesFor(person) {
  */
 async function directReportsOf(person) {
   if (!person) return [];
+  const key = String(person._id);
+  const hit = _directCache.get(key);
+  if (hit && (Date.now() - hit.at) < DOWNLINE_TTL_MS) return hit.reports;
+
   const seedNames = await seedNamesFor(person);
-  const meIdStr = String(person._id);
-  const reports = await User.find(assignedToFilter(seedNames)).select(TEAM_SELECT).lean();
-  return reports.filter((u) => String(u._id) !== meIdStr);
+  const meIdStr = key;
+  const found = await User.find(assignedToFilter(seedNames)).select(TEAM_SELECT).lean();
+  const reports = found.filter((u) => String(u._id) !== meIdStr);
+  _directCache.set(key, { at: Date.now(), reports });
+  return reports;
 }
 
 /**
@@ -147,6 +176,12 @@ async function directReportsOf(person) {
  */
 async function resolveDownline(me) {
   if (!me) return { team: [], names: [] };
+
+  const cacheKey = String(me._id);
+  const cached = _downlineCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) < DOWNLINE_TTL_MS) {
+    return { team: cached.team, names: cached.names };
+  }
 
   const seedNames = await seedNamesFor(me);
   const teamById  = new Map();   // _id string → user (unique downline members)
@@ -202,10 +237,10 @@ async function resolveDownline(me) {
     frontier = [...new Set(next)];
   }
 
-  return {
-    team:  [...teamById.values()],
-    names: [...new Set(namesAll.filter((s) => s && String(s).trim()))],
-  };
+  const team  = [...teamById.values()];
+  const names = [...new Set(namesAll.filter((s) => s && String(s).trim()))];
+  _downlineCache.set(cacheKey, { at: Date.now(), team, names });
+  return { team, names };
 }
 
 async function resolveTeamIds(req) {
@@ -396,10 +431,17 @@ exports.hierarchy = async (req, res) => {
         active:      (r.isActive !== false) &&
                      !['Terminated', 'Inactive', 'Resigned'].includes(String(r.status || 'Active')),
       };
-      // A direct report is itself a MANAGER if anyone reports to them.
-      const sub = await resolveDownline(r);
-      if (sub.team.length > 0) managers.push({ ...base, teamCount: sub.team.length });
-      else                     leaves.push(base);
+      // A direct report is itself a MANAGER if anyone reports to them. Detect
+      // that with a cheap DIRECT-reports lookup first (cached, one query) and
+      // only pay the full-downline BFS for people who are actually managers —
+      // leaf employees (the majority) skip it entirely. (#513 perf)
+      const subDirects = await directReportsOf(r);
+      if (subDirects.length > 0) {
+        const sub = await resolveDownline(r);
+        managers.push({ ...base, teamCount: sub.team.length });
+      } else {
+        leaves.push(base);
+      }
     }
 
     res.json({
@@ -720,7 +762,10 @@ exports.attendanceSummary = async (req, res) => {
   try {
     const scoped = await scopeOrDeny(req, res);
     if (!scoped) return;
-    const { team } = scoped;
+    // #514 — terminated / resigned staff have no ongoing attendance, so they're
+    // excluded from the Attendance Report (they still show as Inactive in the
+    // Team Members list).
+    const team = scoped.team.filter(isActiveMember);
     if (team.length === 0) return res.json({ success: true, items: [] });
 
     const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1);
@@ -790,7 +835,8 @@ exports.liveLocations = async (req, res) => {
   try {
     const scoped = await scopeOrDeny(req, res);
     if (!scoped) return;
-    const { team } = scoped;
+    // #514 — don't track terminated / resigned staff (no active device / shift).
+    const team = scoped.team.filter(isActiveMember);
     if (team.length === 0) return res.json({ success: true, data: [] });
 
     const today = new Date().toISOString().slice(0, 10);

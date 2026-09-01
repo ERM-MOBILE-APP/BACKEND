@@ -80,10 +80,16 @@ async function notifyManagerOfRequest(employeeUserId, opts = {}) {
     const empName =
       emp.name || [emp.firstName, emp.lastName].filter(Boolean).join(' ').trim() || 'An employee';
     const empTag = emp.employeeId ? ` (${emp.employeeId})` : '';
+    // #512 — the notification title must distinguish a Permission from a Leave.
+    // Both are stored in the Leave collection and notified with type:'leave',
+    // so callers pass an explicit `kindLabel` (e.g. 'permission request') to
+    // override the type-derived default; otherwise it fell back to
+    // 'leave request' and a permission wrongly read as a leave request.
     const kindLabel =
-      opts.type === 'allowance' ? 'allowance claim'
-        : opts.type === 'attendance' ? 'attendance request'
-          : 'leave request';
+      opts.kindLabel ? opts.kindLabel
+        : opts.type === 'allowance' ? 'allowance claim'
+          : opts.type === 'attendance' ? 'attendance request'
+            : 'leave request';
 
     return await notify(managerId, {
       title: `New ${kindLabel} from ${empName}`,

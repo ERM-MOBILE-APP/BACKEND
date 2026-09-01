@@ -231,6 +231,7 @@ exports.applyPermission = async (req, res) => {
       const { notifyManagerOfRequest } = require('../utils/notifyManager');
       notifyManagerOfRequest(req.user.id, {
         type: 'leave',
+        kindLabel: 'permission request',
         summary: `Permission ${date} (${startTime}–${endTime})`,
       }).catch(() => {});
     } catch (_) { /* best-effort */ }
