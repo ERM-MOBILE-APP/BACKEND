@@ -1089,6 +1089,24 @@ function isBeforeErmStart(month, year) {
 exports.isBeforeErmStart = isBeforeErmStart;
 exports.ERM_START = { year: ERM_START_YEAR, month: ERM_START_MONTH, date: '2026-07-01' };
 
+// #540 — Was this check-in late? On-time cutoff is 10:00 IST; anything at
+// 10:01 or later is late (the 10:01–10:10 tier is 'late' at check-in, and
+// 10:11+ is 'absent' unless HR later marks the day present). Returns true for
+// any check-in after 10:00 IST so HR marking a late day "present" does NOT
+// erase the lateness. Render runs in UTC, so we read the wall-clock in
+// Asia/Kolkata via Intl.
+function isLateCheckIn(checkIn) {
+  if (!checkIn) return false;
+  const d = new Date(checkIn);
+  if (isNaN(d.getTime())) return false;
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const h = parseInt(parts.find((p) => p.type === 'hour')?.value   || '0', 10);
+  const m = parseInt(parts.find((p) => p.type === 'minute')?.value || '0', 10);
+  return (h * 60 + m) >= (10 * 60 + 1); // >= 10:01
+}
+
 async function computeMonthlySummary(userId, month, year) {
   // Months before the ERM start date have no valid data — return zeros
   // WITHOUT querying, so pre-July-2026 records can never surface.
@@ -1145,9 +1163,17 @@ async function computeMonthlySummary(userId, month, year) {
       // #453 — normalised so an HRMS-written 'On Time' / 'Half Day' still
       // lands in the right counter instead of being silently ignored (which
       // previously under-counted Present/Half-day for HR-edited days).
-      const effective = normalizeStatus(
-        (r.hrOverride === true && r.hrOverrideStatus) ? r.hrOverrideStatus : r.status
-      );
+      const usedOverride = (r.hrOverride === true && r.hrOverrideStatus);
+      let effective = normalizeStatus(usedOverride ? r.hrOverrideStatus : r.status);
+      // #540 — When HR marks a LATE check-in as Present (e.g. someone who
+      // checked in at 10:13 was Absent, then HR overrides to Present), keep
+      // the day in the LATE bucket. The report shows Present = present + late,
+      // so a late-bucket day still appears in BOTH Present and Late — HR's
+      // "mark present" no longer erases the lateness. Only applies to a real
+      // HR override (not permission-excused days, which have hrOverride=false).
+      if (effective === 'present' && usedOverride && isLateCheckIn(r.checkIn)) {
+        effective = 'late';
+      }
       if (summary[effective] !== undefined) summary[effective] += 1;
     });
 
