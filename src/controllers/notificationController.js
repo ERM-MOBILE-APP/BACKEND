@@ -2,6 +2,74 @@ const Notification = require('../models/Notification');
 const User = require('../models/User');
 const DeviceToken = require('../models/DeviceToken');
 
+// POST /api/notification/admin/push   (header: x-admin-secret)
+// Server-to-server FCM fan-out. The ERM Web backend has NO Firebase service
+// account, so when a web-originated event needs a system notification it calls
+// this endpoint; we look up the user's device tokens (browser + phone, shared
+// DeviceToken collection) and push via firebase-admin. Body:
+//   { userId | employeeId, title, body, link?, type?, notificationId? }
+exports.adminPush = async (req, res) => {
+  try {
+    const expected = (process.env.MOBILE_ADMIN_SECRET || process.env.ADMIN_SECRET || '').trim();
+    const got      = String(req.headers['x-admin-secret'] || '').trim();
+    if (!expected || got !== expected) {
+      return res.status(401).json({ success: false, message: 'Missing/invalid x-admin-secret.' });
+    }
+    let { userId, employeeId, title, body, link, type, notificationId } = req.body || {};
+    if (!title) return res.status(400).json({ success: false, message: 'title is required.' });
+
+    // Resolve the target user — accept a Mongo _id or an employeeId string.
+    if (!userId && employeeId) {
+      const u = await User.findOne({ employeeId: String(employeeId) }).select('_id').lean();
+      userId = u && u._id;
+    }
+    if (!userId) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const { sendFcmToUser } = require('../utils/fcm');
+    await sendFcmToUser(userId, {
+      title,
+      body,
+      data: {
+        type: type || 'general',
+        link: link || '',
+        notificationId: notificationId || '',
+      },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[notification.adminPush]', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/notification/admin/broadcast   (header: x-admin-secret)
+// Company-wide FCM push — used when HRMS or ERM Web posts a broadcast/company
+// announcement. Those backends have no Firebase service account, so they call
+// this to push a system notification to EVERY registered device.
+//   Body: { title, body, link?, type? }
+exports.adminBroadcast = async (req, res) => {
+  try {
+    const expected = (process.env.MOBILE_ADMIN_SECRET || process.env.ADMIN_SECRET || '').trim();
+    const got      = String(req.headers['x-admin-secret'] || '').trim();
+    if (!expected || got !== expected) {
+      return res.status(401).json({ success: false, message: 'Missing/invalid x-admin-secret.' });
+    }
+    const { title, body, link, type } = req.body || {};
+    if (!title) return res.status(400).json({ success: false, message: 'title is required.' });
+
+    const { sendFcmBroadcast } = require('../utils/fcm');
+    const result = await sendFcmBroadcast({
+      title,
+      body,
+      data: { type: type || 'announcement', link: link || '' },
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[notification.adminBroadcast]', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // POST /api/notification/register-device   { token, platform?, deviceId? }
 // Store the device's FCM registration token against the LOGGED-IN user so the
 // backend (via firebase-admin) can push to it. Upsert on `token` so:
